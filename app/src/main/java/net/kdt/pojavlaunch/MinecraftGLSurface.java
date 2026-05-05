@@ -86,8 +86,11 @@ public class MinecraftGLSurface extends FrameLayout implements GrabListener {
     @Nullable private Runnable touchLongPressRunnable;
     public static volatile boolean sdlEnabled = false;
 
+    private static final long POINTER_REGRAB_RELATIVE_SUPPRESS_NANOS = 220_000_000L;
+
     private final Set<Integer> hardwareKeysDown = new HashSet<>();
     private final Set<Integer> hardwareMouseButtonsDown = new HashSet<>();
+    private long suppressRelativeCursorUntilNanos;
 
     // Some Android devices dispatch physical mouse clicks as normal touch DOWN/UP
     // events instead of generic ACTION_BUTTON_PRESS/RELEASE events. Keep the
@@ -226,10 +229,12 @@ public class MinecraftGLSurface extends FrameLayout implements GrabListener {
     }
 
     private void addRenderView(@NonNull View child) {
-        addView(child, new ViewGroup.LayoutParams(
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT
-        ));
+        );
+        addView(child, lp);
+        child.requestLayout();
     }
     @Override
     protected void onSizeChanged(int w, int h, int oldw, int oldh) {
@@ -843,8 +848,8 @@ public class MinecraftGLSurface extends FrameLayout implements GrabListener {
 
     private void sendTapClickAt(float x, float y) {
         CallbackBridge.setInputReady(true);
-        float clampedX = clamp(scaleInputX(x), 0f, Math.max(1, CallbackBridge.windowWidth));
-        float clampedY = clamp(scaleInputY(y), 0f, Math.max(1, CallbackBridge.windowHeight));
+        float clampedX = mapViewXToCursorX(x);
+        float clampedY = mapViewYToCursorY(y);
         // Keep the grabbed-mode invariant: do not call sendCursorPos() for a tap.
         // putMouseEventWithCoords() carries the click coordinates without first warping
         // the grabbed cursor, which prevents touch taps from snapping the camera.
@@ -868,16 +873,53 @@ public class MinecraftGLSurface extends FrameLayout implements GrabListener {
 
     private void sendAbsoluteCursor(float x, float y) {
         CallbackBridge.setInputReady(true);
-        CallbackBridge.mouseX = clamp(scaleInputX(x), 0f, Math.max(1, CallbackBridge.windowWidth));
-        CallbackBridge.mouseY = clamp(scaleInputY(y), 0f, Math.max(1, CallbackBridge.windowHeight));
+        CallbackBridge.mouseX = mapViewXToCursorX(x);
+        CallbackBridge.mouseY = mapViewYToCursorY(y);
         CallbackBridge.sendCursorPos(CallbackBridge.mouseX, CallbackBridge.mouseY);
     }
 
+    private float mapViewXToCursorX(float x) {
+        return mapViewCoordinateToCursorCoordinate(
+                x,
+                Math.max(1f, viewWidth),
+                Math.max(1f, CallbackBridge.windowWidth)
+        );
+    }
+
+    private float mapViewYToCursorY(float y) {
+        return mapViewCoordinateToCursorCoordinate(
+                y,
+                Math.max(1f, viewHeight),
+                Math.max(1f, CallbackBridge.windowHeight)
+        );
+    }
+
+    private static float mapViewCoordinateToCursorCoordinate(float value, float viewSize, float bridgeSize) {
+        // Android MotionEvent coordinates are effectively 0..viewSize-1 and
+        // GLFW menu coordinates are 0..bridgeSize-1. The old scaleInputX/Y math
+        // used size/size, which leaves the last GUI pixel difficult or impossible
+        // to hit on the right/bottom edge, especially with SurfaceView and
+        // resolution scaling. Map edge-to-edge instead.
+        float maxView = Math.max(0f, viewSize - 1f);
+        float maxBridge = Math.max(0f, bridgeSize - 1f);
+        if (maxView <= 0f || maxBridge <= 0f) return 0f;
+        return clamp(clamp(value, 0f, maxView) * maxBridge / maxView, 0f, maxBridge);
+    }
+
     private void sendRelativeCursor(float dx, float dy) {
+        if (shouldSuppressRelativeCursor()) {
+            return;
+        }
+
         CallbackBridge.setInputReady(true);
         CallbackBridge.mouseX += scaleDeltaX(dx);
         CallbackBridge.mouseY += scaleDeltaY(dy);
         CallbackBridge.sendCursorPos(CallbackBridge.mouseX, CallbackBridge.mouseY);
+    }
+
+    private boolean shouldSuppressRelativeCursor() {
+        long until = suppressRelativeCursorUntilNanos;
+        return grabbed && until > 0L && System.nanoTime() < until;
     }
 
     private void sendHardwareRelativeCursor(float dx, float dy) {
@@ -953,9 +995,18 @@ public class MinecraftGLSurface extends FrameLayout implements GrabListener {
         grabbed = isGrabbing;
         post(() -> {
             if (isGrabbing) {
-                CallbackBridge.mouseX = CallbackBridge.windowWidth / 2f;
-                CallbackBridge.mouseY = CallbackBridge.windowHeight / 2f;
-                CallbackBridge.sendCursorPos(CallbackBridge.mouseX, CallbackBridge.mouseY);
+                // Important for old Minecraft builds such as beta 1.7.3:
+                // do not recenter and send an absolute cursor position when the
+                // game re-grabs input after a GUI closes. Those builds can treat
+                // the center warp as real mouse movement, which snaps the camera
+                // straight to the sky/floor. Keep the current virtual cursor as
+                // the relative-input baseline and only send movement when the
+                // user actually moves touch/mouse/controller again.
+                suppressRelativeCursorUntilNanos = System.nanoTime() + POINTER_REGRAB_RELATIVE_SUPPRESS_NANOS;
+                cancelTouchLongPressAttack(true);
+                resetTouchTracking();
+                releaseAllHardwareMouseButtons();
+
                 if (hasRealExternalPointerDevice()) {
                     safeRequestPointerCapture();
                 } else {
@@ -963,6 +1014,7 @@ public class MinecraftGLSurface extends FrameLayout implements GrabListener {
                     safeReleasePointerCapture();
                 }
             } else {
+                suppressRelativeCursorUntilNanos = 0L;
                 safeReleasePointerCapture();
             }
         });

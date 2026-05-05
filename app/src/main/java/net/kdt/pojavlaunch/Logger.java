@@ -26,12 +26,25 @@ import java.io.File;
 import java.util.concurrent.CopyOnWriteArrayList;
 
 import ca.dnamobile.javalauncher.feature.log.Logging;
+import ca.dnamobile.javalauncher.logs.LatestLogTextFilter;
 
 public final class Logger {
     private static final String TAG = "PojavLogger";
     private static volatile File currentLogFile;
     private static final CopyOnWriteArrayList<eventLogListener> LOG_LISTENERS = new CopyOnWriteArrayList<>();
-    private static final eventLogListener DISPATCHER = line -> {
+
+    /*
+     * Keep appendToLog(String) as the native method.
+     *
+     * Do not rename it unless you also update the JNI side in pojavexec.
+     * This dispatcher only cleans what is sent to Java listeners/log overlay.
+     * The actual latestlog.txt file is cleaned safely by LauncherLogManager
+     * after launch output is written.
+     */
+    private static final eventLogListener DISPATCHER = rawLine -> {
+        String line = LatestLogTextFilter.cleanRealtimeLine(rawLine);
+        if (line == null) return;
+
         for (eventLogListener listener : LOG_LISTENERS) {
             try {
                 listener.onEventLogged(line);

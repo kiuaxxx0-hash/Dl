@@ -17,13 +17,16 @@ import android.content.Context;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
+import android.graphics.Rect;
 import android.graphics.RectF;
 import android.graphics.drawable.GradientDrawable;
+import android.os.Build;
 import android.text.Editable;
 import android.text.InputType;
 import android.os.Handler;
 import android.os.Looper;
 import android.text.TextWatcher;
+import android.util.DisplayMetrics;
 import android.view.InputDevice;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
@@ -31,6 +34,7 @@ import android.view.View;
 import android.view.ViewConfiguration;
 import android.view.ViewGroup;
 import android.view.ViewParent;
+import android.view.WindowManager;
 import android.util.SparseArray;
 import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
@@ -237,23 +241,26 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
         removeAllViews();
         int parentWidth = Math.max(1, getWidth());
         int parentHeight = Math.max(1, getHeight());
+        LayoutMetrics metrics = layoutMetrics(parentWidth, parentHeight);
+        float density = getResources().getDisplayMetrics().density;
         for (TouchControlData control : layoutData.controls) {
             if (!editMode && !control.visibleInGame) continue;
             TouchControlButtonView button = new TouchControlButtonView(getContext(), control, this);
             button.setEditMode(editMode);
             button.setVisibility(editMode || controlsVisible ? VISIBLE : INVISIBLE);
-            int width = Math.max(32, Math.round(control.width * getResources().getDisplayMetrics().density));
-            int height = Math.max(32, Math.round(control.height * getResources().getDisplayMetrics().density));
-            width = Math.min(width, parentWidth);
-            height = Math.min(height, parentHeight);
+            int width = Math.min(metrics.toScreenWidth(control.width), parentWidth);
+            int height = Math.min(metrics.toScreenHeight(control.height), parentHeight);
             FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(width, height);
             addView(button, params);
 
-            float density = getResources().getDisplayMetrics().density;
-            float fallbackX = control.rawX == null ? control.x * density : control.x;
-            float fallbackY = control.rawY == null ? control.y * density : control.y;
-            float resolvedX = ExpressionResolver.resolve(control.rawX, fallbackX, parentWidth, parentHeight, width, height, density, layoutData.preferredScale);
-            float resolvedY = ExpressionResolver.resolve(control.rawY, fallbackY, parentWidth, parentHeight, width, height, density, layoutData.preferredScale);
+            float fallbackX = metrics.toScreenX(control, width);
+            float fallbackY = metrics.toScreenY(control, height);
+            float resolvedX = control.rawX == null
+                    ? fallbackX
+                    : ExpressionResolver.resolve(control.rawX, fallbackX, parentWidth, parentHeight, width, height, density, layoutData.preferredScale, metrics.formulaPixelScale);
+            float resolvedY = control.rawY == null
+                    ? fallbackY
+                    : ExpressionResolver.resolve(control.rawY, fallbackY, parentWidth, parentHeight, width, height, density, layoutData.preferredScale, metrics.formulaPixelScale);
             resolvedX = Math.max(0f, Math.min(Math.max(0, parentWidth - width), resolvedX));
             resolvedY = Math.max(0f, Math.min(Math.max(0, parentHeight - height), resolvedY));
             button.setX(resolvedX);
@@ -425,12 +432,12 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
             float proposedY
     ) {
         float[] snapped = resolveDraggedPosition(view, proposedX, proposedY);
-        float density = getResources().getDisplayMetrics().density;
+        LayoutMetrics metrics = layoutMetrics(getWidth(), getHeight());
 
-        // X/Y are stored in the same user-facing layout units as Width/Height.
-        // The Android view still moves in physical pixels.
-        data.x = snapped[0] / Math.max(1f, density);
-        data.y = snapped[1] / Math.max(1f, density);
+        // X/Y are stored in the layout's own units. JavaLauncher layouts use dp;
+        // imported default_touch.json / Pojav-style layouts use source-canvas px.
+        data.x = metrics.fromScreenX(data, snapped[0], view.getWidth());
+        data.y = metrics.fromScreenY(snapped[1]);
         data.rawX = null;
         data.rawY = null;
 
@@ -565,16 +572,16 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
         String originalRawX = data.rawX;
         String originalRawY = data.rawY;
 
-        float density = getResources().getDisplayMetrics().density;
-        int parentWidthUnits = Math.max(1, Math.round(getWidth() / Math.max(0.1f, density)));
-        int parentHeightUnits = Math.max(1, Math.round(getHeight() / Math.max(0.1f, density)));
+        LayoutMetrics metrics = layoutMetrics(getWidth(), getHeight());
+        int parentWidthUnits = Math.max(1, Math.round(metrics.maxLayoutXUnits()));
+        int parentHeightUnits = Math.max(1, Math.round(metrics.maxLayoutYUnits()));
 
         // Imported Zalith/Mojo/Amethyst controls may still have dynamic rawX/rawY
         // formulas. Show their current resolved position converted back into the
-        // same layout units as Width/Height. Saving clears rawX/rawY and keeps
-        // the button exactly where the user sees it.
-        float initialLayoutX = data.rawX == null ? data.x : editingView.getX() / Math.max(1f, density);
-        float initialLayoutY = data.rawY == null ? data.y : editingView.getY() / Math.max(1f, density);
+        // layout's own units. Saving clears rawX/rawY and keeps the button exactly
+        // where the user sees it.
+        float initialLayoutX = data.rawX == null ? data.x : metrics.fromScreenX(data, editingView.getX(), editingView.getWidth());
+        float initialLayoutY = data.rawY == null ? data.y : metrics.fromScreenY(editingView.getY());
 
         ScrollView scrollView = new ScrollView(context);
         LinearLayout layout = new LinearLayout(context);
@@ -954,6 +961,198 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
         dialog.show();
     }
 
+    @NonNull
+    private LayoutMetrics layoutMetrics(float parentWidth, float parentHeight) {
+        float density = Math.max(0.1f, getResources().getDisplayMetrics().density);
+        float safeParentWidth = Math.max(1f, parentWidth);
+        float safeParentHeight = Math.max(1f, parentHeight);
+
+        if (layoutData.usesPixelCoordinates()) {
+            float sourceWidth = layoutData.resolvedSourceWidth(safeParentWidth);
+            float sourceHeight = layoutData.resolvedSourceHeight(safeParentHeight);
+            float[] realDisplay = realDisplaySize(safeParentWidth, safeParentHeight);
+
+            float parentScale = Math.min(
+                    safeParentWidth / Math.max(1f, sourceWidth),
+                    safeParentHeight / Math.max(1f, sourceHeight)
+            );
+            float realScale = Math.min(
+                    realDisplay[0] / Math.max(1f, sourceWidth),
+                    realDisplay[1] / Math.max(1f, sourceHeight)
+            );
+
+            float uniformScale = Math.max(parentScale, realScale);
+
+            // Legacy default_touch.json files from a 1920x1080 device normally land
+            // as an 854x480-ish logical canvas. Ultrawide devices can report a shorter
+            // app surface even though the physical game buffer is still 1080p-class,
+            // which made the overlay shrink vertically. Keep those layouts at least at
+            // their original 1080p scale when the current display is 1080p-class.
+            boolean legacy1080pCanvas = sourceWidth <= 960f
+                    && sourceHeight <= 540f
+                    && Math.max(safeParentWidth, realDisplay[0]) >= 1800f
+                    && Math.max(safeParentHeight, realDisplay[1]) >= 900f;
+            if (legacy1080pCanvas) {
+                uniformScale = Math.max(uniformScale, 1080f / Math.max(1f, sourceHeight));
+            }
+
+            return new LayoutMetrics(
+                    true,
+                    safeParentWidth,
+                    safeParentHeight,
+                    sourceWidth,
+                    sourceHeight,
+                    uniformScale,
+                    uniformScale,
+                    uniformScale,
+                    uniformScale
+            );
+        }
+
+        return new LayoutMetrics(
+                false,
+                safeParentWidth,
+                safeParentHeight,
+                safeParentWidth / density,
+                safeParentHeight / density,
+                density,
+                density,
+                density,
+                density
+        );
+    }
+
+    @NonNull
+    private float[] realDisplaySize(float parentWidth, float parentHeight) {
+        float realWidth = Math.max(1f, parentWidth);
+        float realHeight = Math.max(1f, parentHeight);
+
+        try {
+            WindowManager windowManager = (WindowManager) getContext().getSystemService(Context.WINDOW_SERVICE);
+            if (windowManager != null) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    Rect current = windowManager.getCurrentWindowMetrics().getBounds();
+                    Rect maximum = windowManager.getMaximumWindowMetrics().getBounds();
+                    realWidth = Math.max(realWidth, Math.max(current.width(), maximum.width()));
+                    realHeight = Math.max(realHeight, Math.max(current.height(), maximum.height()));
+                } else {
+                    DisplayMetrics metrics = new DisplayMetrics();
+                    //noinspection deprecation
+                    windowManager.getDefaultDisplay().getRealMetrics(metrics);
+                    realWidth = Math.max(realWidth, metrics.widthPixels);
+                    realHeight = Math.max(realHeight, metrics.heightPixels);
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+
+        boolean landscape = parentWidth >= parentHeight;
+        float longSide = Math.max(realWidth, realHeight);
+        float shortSide = Math.min(realWidth, realHeight);
+        return landscape ? new float[]{longSide, shortSide} : new float[]{shortSide, longSide};
+    }
+
+    private static final class LayoutMetrics {
+        final boolean pixelCoordinates;
+        final float parentWidth;
+        final float parentHeight;
+        final float sourceWidth;
+        final float sourceHeight;
+        final float xScale;
+        final float yScale;
+        final float sizeScale;
+        final float formulaPixelScale;
+
+        LayoutMetrics(
+                boolean pixelCoordinates,
+                float parentWidth,
+                float parentHeight,
+                float sourceWidth,
+                float sourceHeight,
+                float xScale,
+                float yScale,
+                float sizeScale,
+                float formulaPixelScale
+        ) {
+            this.pixelCoordinates = pixelCoordinates;
+            this.parentWidth = Math.max(1f, parentWidth);
+            this.parentHeight = Math.max(1f, parentHeight);
+            this.sourceWidth = Math.max(1f, sourceWidth);
+            this.sourceHeight = Math.max(1f, sourceHeight);
+            this.xScale = Math.max(0.1f, xScale);
+            this.yScale = Math.max(0.1f, yScale);
+            this.sizeScale = Math.max(0.1f, sizeScale);
+            this.formulaPixelScale = Math.max(0.1f, formulaPixelScale);
+        }
+
+        int toScreenWidth(float value) {
+            return Math.max(32, Math.round(Math.max(1f, value) * sizeScale));
+        }
+
+        int toScreenHeight(float value) {
+            return Math.max(32, Math.round(Math.max(1f, value) * sizeScale));
+        }
+
+        float toScreenX(@NonNull TouchControlData control, float screenControlWidth) {
+            if (!pixelCoordinates) return control.x * xScale;
+
+            float sourceControlWidth = Math.max(1f, control.width);
+            float sourceCenterX = control.x + (sourceControlWidth / 2f);
+            float rightThreshold = sourceWidth * 0.58f;
+            float leftThreshold = sourceWidth * 0.42f;
+
+            if (sourceCenterX >= rightThreshold) {
+                float sourceRightOffset = Math.max(0f, sourceWidth - control.x - sourceControlWidth);
+                return parentWidth - (sourceRightOffset * sizeScale) - screenControlWidth;
+            }
+
+            if (sourceCenterX <= leftThreshold) {
+                return control.x * sizeScale;
+            }
+
+            float sourceCenterOffset = sourceCenterX - (sourceWidth / 2f);
+            return (parentWidth / 2f) + (sourceCenterOffset * sizeScale) - (screenControlWidth / 2f);
+        }
+
+        float toScreenY(@NonNull TouchControlData control, float screenControlHeight) {
+            if (!pixelCoordinates) return control.y * yScale;
+            return control.y * sizeScale;
+        }
+
+        float fromScreenX(@NonNull TouchControlData control, float screenX, float screenControlWidth) {
+            if (!pixelCoordinates) return screenX / xScale;
+
+            float sourceControlWidth = Math.max(1f, control.width);
+            float sourceCenterX = control.x + (sourceControlWidth / 2f);
+            float rightThreshold = sourceWidth * 0.58f;
+            float leftThreshold = sourceWidth * 0.42f;
+
+            if (sourceCenterX >= rightThreshold) {
+                float screenRightOffset = Math.max(0f, parentWidth - screenX - screenControlWidth);
+                return sourceWidth - (screenRightOffset / sizeScale) - sourceControlWidth;
+            }
+
+            if (sourceCenterX <= leftThreshold) {
+                return screenX / sizeScale;
+            }
+
+            float screenCenter = screenX + (screenControlWidth / 2f);
+            return (sourceWidth / 2f) + ((screenCenter - (parentWidth / 2f)) / sizeScale) - (sourceControlWidth / 2f);
+        }
+
+        float fromScreenY(float screenY) {
+            return screenY / (pixelCoordinates ? sizeScale : yScale);
+        }
+
+        float maxLayoutXUnits() {
+            return pixelCoordinates ? sourceWidth : parentWidth / xScale;
+        }
+
+        float maxLayoutYUnits() {
+            return pixelCoordinates ? sourceHeight : parentHeight / yScale;
+        }
+    }
+
     private void addSectionHeader(@NonNull LinearLayout parent, @NonNull String title, @Nullable String subtitle) {
         TextView header = new TextView(getContext());
         header.setText(title);
@@ -1042,9 +1241,9 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
     }
 
     private void applyControlPreview(@NonNull TouchControlButtonView view, @NonNull TouchControlData data) {
-        float density = getResources().getDisplayMetrics().density;
-        int width = Math.max(32, Math.round(data.width * density));
-        int height = Math.max(32, Math.round(data.height * density));
+        LayoutMetrics metrics = layoutMetrics(getWidth(), getHeight());
+        int width = metrics.toScreenWidth(data.width);
+        int height = metrics.toScreenHeight(data.height);
         width = Math.min(width, Math.max(1, getWidth()));
         height = Math.min(height, Math.max(1, getHeight()));
 
@@ -1055,8 +1254,8 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
             view.setLayoutParams(params);
         }
 
-        view.setX(clamp(data.x * density, 0f, Math.max(0f, getWidth() - width)));
-        view.setY(clamp(data.y * density, 0f, Math.max(0f, getHeight() - height)));
+        view.setX(clamp(metrics.toScreenX(data, width), 0f, Math.max(0f, getWidth() - width)));
+        view.setY(clamp(metrics.toScreenY(data, height), 0f, Math.max(0f, getHeight() - height)));
         view.setText(data.label);
         view.setAlpha(Math.max(0.15f, Math.min(1f, data.opacity)) * ControlsPreferences.getGlobalOpacity(getContext()));
         view.refreshVisualState();
