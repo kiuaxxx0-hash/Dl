@@ -12,11 +12,13 @@
 
 package ca.dnamobile.javalauncher.modcompat;
 
+import android.content.Context;
 import android.util.Log;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
@@ -37,14 +39,30 @@ import net.kdt.pojavlaunch.Logger;
 
 public final class VulkanModLwjglMitigation {
     private static final String TAG = "VulkanModLwjglMitigation";
-    private static final String MARKER_ENTRY = "META-INF/javalauncher/vulkanmod_lwjgl_override";
-    private static final String LEGACY_MARKER_ENTRY = "META-INF/zalith/vulkanmod_lwjgl_override";
+    private static final String MARKER_ENTRY = "META-INF/javalauncher/vulkanmod_lwjgl_override_v2";
+    private static final String LEGACY_MARKER_ENTRY = "META-INF/javalauncher/vulkanmod_lwjgl_override";
+    private static final String ZALITH_LEGACY_MARKER_ENTRY = "META-INF/zalith/vulkanmod_lwjgl_override";
     private static final String WORK_DIR_NAME = ".javalauncher_patch";
+
+    private static final String LEGACY_1201_ANDROID_LIBS_ASSET =
+            "modcompat/vulkanmod-android-libs_0.1.0.jar";
+    private static final String LEGACY_1201_ANDROID_LIBS_FILE =
+            "vulkanMod-android-libs_0.1.0.jar";
+
+    // Marker from an older DroidBridge test that incorrectly lower-cased VulkanMod
+    // shader resource paths. Keep the repair here so removing the Beryl mitigation
+    // does not leave VulkanMod jars in a broken state.
+    private static final String OLD_BERYL_VULKAN_PATH_MARKER =
+            "META-INF/droidbridge/beryl_vulkan_lowercase_shader_paths_v2";
 
     private VulkanModLwjglMitigation() {
     }
 
     public static void prepare(@Nullable File gameDir) {
+        prepare(null, gameDir);
+    }
+
+    public static void prepare(@Nullable Context context, @Nullable File gameDir) {
         if (gameDir == null) return;
 
         appendBlankLogLine();
@@ -57,8 +75,17 @@ public final class VulkanModLwjglMitigation {
             for (File modsDir : modsDirs) {
                 appendLog("VulkanMod mitigation: scanning " + modsDir.getAbsolutePath() + " exists=" + modsDir.exists());
 
-                File[] mods = modsDir.listFiles(file -> file.isFile() && file.getName().toLowerCase(java.util.Locale.ROOT).endsWith(".jar"));
+                File[] mods = listJarFiles(modsDir);
                 if (mods == null || mods.length == 0) continue;
+
+                boolean hasLegacy1201VulkanMod = containsLegacy1201VulkanMod(mods);
+                if (hasLegacy1201VulkanMod) {
+                    ensureLegacy1201AndroidLibs(context, modsDir, mods);
+                    mods = listJarFiles(modsDir);
+                    if (mods == null || mods.length == 0) continue;
+                }
+
+                boolean hasLegacy1201AndroidLibs = hasLegacy1201AndroidLibs(mods);
 
                 for (File modJar : mods) {
                     String lowerName = modJar.getName().toLowerCase(java.util.Locale.ROOT);
@@ -68,21 +95,27 @@ public final class VulkanModLwjglMitigation {
                     appendLog("VulkanMod mitigation: found mod jar " + modJar.getAbsolutePath());
 
                     try {
-                        if (!containsBundledLwjglVulkan(modJar)) {
-                            appendLog("VulkanMod mitigation: no bundled lwjgl-vulkan nested jar in " + modJar.getName());
-                            Log.i(TAG, "VulkanMod found but no bundled lwjgl-vulkan nested jar was detected: " + modJar.getName());
+                        repairVulkanModJarFromOldShaderPathPatch(modJar);
+
+                        boolean stripLegacyVmaShaderc = hasLegacy1201AndroidLibs
+                                && isLegacy1201VulkanModJar(modJar)
+                                && !isLegacy1201AndroidLibsJar(modJar);
+
+                        if (!containsBundledLwjglToStrip(modJar, stripLegacyVmaShaderc)) {
+                            appendLog("VulkanMod mitigation: no bundled LWJGL entries to strip in " + modJar.getName());
+                            Log.i(TAG, "VulkanMod found but no bundled LWJGL entries to strip were detected: " + modJar.getName());
                             continue;
                         }
 
-                        if (isAlreadyPatched(modJar)) {
+                        if (isAlreadyPatched(modJar, stripLegacyVmaShaderc)) {
                             appendLog("VulkanMod mitigation: already patched " + modJar.getAbsolutePath());
                             Log.i(TAG, "VulkanMod already patched: " + modJar.getName());
                             continue;
                         }
 
-                        patchVulkanModJar(modJar);
+                        patchVulkanModJar(modJar, stripLegacyVmaShaderc);
                         appendLog("VulkanMod mitigation: patched successfully " + modJar.getAbsolutePath());
-                        Log.i(TAG, "Patched VulkanMod to strip bundled lwjgl-vulkan: " + modJar.getAbsolutePath());
+                        Log.i(TAG, "Patched VulkanMod LWJGL compatibility: " + modJar.getAbsolutePath());
                     } catch (Throwable throwable) {
                         appendLog("VulkanMod mitigation: failed for " + modJar.getAbsolutePath() + ": " + throwable);
                         Log.e(TAG, "Failed to patch VulkanMod jar: " + modJar.getAbsolutePath(), throwable);
@@ -129,13 +162,44 @@ public final class VulkanModLwjglMitigation {
         return null;
     }
 
-    private static boolean containsBundledLwjglVulkan(@NonNull File jarFile) throws IOException {
+    private static void repairVulkanModJarFromOldShaderPathPatch(@NonNull File jarFile) throws IOException {
+        if (!hasEntry(jarFile, OLD_BERYL_VULKAN_PATH_MARKER)) return;
+
+        File parentDir = jarFile.getParentFile();
+        if (parentDir == null) return;
+
+        File backup = new File(new File(parentDir, WORK_DIR_NAME), jarFile.getName() + ".beryl-vulkan-paths.backup");
+        if (!backup.isFile()) {
+            appendLog("VulkanMod mitigation: old shader-path patch marker found but backup is missing; reinstall a clean VulkanMod jar: " + jarFile.getName());
+            return;
+        }
+
+        copyFile(backup, jarFile);
+        appendLog("VulkanMod mitigation: restored VulkanMod jar from old shader-path backup: " + jarFile.getName());
+    }
+
+    private static boolean hasEntry(@NonNull File jarFile, @NonNull String entryName) throws IOException {
+        try (ZipFile zipFile = new ZipFile(jarFile)) {
+            return zipFile.getEntry(entryName) != null;
+        }
+    }
+
+    @Nullable
+    private static File[] listJarFiles(@NonNull File modsDir) {
+        return modsDir.listFiles(file -> file.isFile()
+                && file.getName().toLowerCase(java.util.Locale.ROOT).endsWith(".jar"));
+    }
+
+    private static boolean containsBundledLwjglToStrip(
+            @NonNull File jarFile,
+            boolean stripLegacyVmaShaderc
+    ) throws IOException {
         try (ZipFile zipFile = new ZipFile(jarFile)) {
             Enumeration<? extends ZipEntry> entries = zipFile.entries();
             while (entries.hasMoreElements()) {
                 ZipEntry entry = entries.nextElement();
-                if (shouldStripBundledLwjglVulkan(entry.getName())) {
-                    appendLog("VulkanMod mitigation: found nested Vulkan jar entry " + entry.getName());
+                if (shouldStripBundledLwjgl(entry.getName(), stripLegacyVmaShaderc)) {
+                    appendLog("VulkanMod mitigation: found nested LWJGL jar entry " + entry.getName());
                     return true;
                 }
             }
@@ -143,13 +207,27 @@ public final class VulkanModLwjglMitigation {
         return false;
     }
 
-    private static boolean isAlreadyPatched(@NonNull File jarFile) throws IOException {
+    private static boolean isAlreadyPatched(
+            @NonNull File jarFile,
+            boolean stripLegacyVmaShaderc
+    ) throws IOException {
         try (ZipFile zipFile = new ZipFile(jarFile)) {
-            return zipFile.getEntry(MARKER_ENTRY) != null || zipFile.getEntry(LEGACY_MARKER_ENTRY) != null;
+            if (zipFile.getEntry(MARKER_ENTRY) != null) return true;
+
+            // Version-1 patches only stripped lwjgl-vulkan. That is enough for modern
+            // VulkanMod, but legacy 1.20.1 VulkanMod still needs its bundled
+            // lwjgl-vma/lwjgl-shaderc 3.3.2 jars removed when the Android helper is
+            // present, otherwise it crashes with VmaVulkanFunctions/Struct mismatch.
+            boolean hasOldMarker = zipFile.getEntry(LEGACY_MARKER_ENTRY) != null
+                    || zipFile.getEntry(ZALITH_LEGACY_MARKER_ENTRY) != null;
+            return hasOldMarker && !stripLegacyVmaShaderc;
         }
     }
 
-    private static void patchVulkanModJar(@NonNull File jarFile) throws IOException {
+    private static void patchVulkanModJar(
+            @NonNull File jarFile,
+            boolean stripLegacyVmaShaderc
+    ) throws IOException {
         File parentDir = jarFile.getParentFile();
         if (parentDir == null) {
             throw new IOException("Could not resolve VulkanMod jar parent directory: " + jarFile.getAbsolutePath());
@@ -180,9 +258,9 @@ public final class VulkanModLwjglMitigation {
                 ZipEntry inEntry = entries.nextElement();
                 String name = inEntry.getName();
 
-                if (shouldStripBundledLwjglVulkan(name)) {
+                if (shouldStripBundledLwjgl(name, stripLegacyVmaShaderc)) {
                     appendLog("VulkanMod mitigation: stripping nested entry " + name);
-                    Log.i(TAG, "Stripping nested Vulkan LWJGL jar entry: " + name);
+                    Log.i(TAG, "Stripping nested LWJGL jar entry: " + name);
                     stripped = true;
                     continue;
                 }
@@ -260,14 +338,141 @@ public final class VulkanModLwjglMitigation {
         copyFile(backup, jarFile);
     }
 
-    private static boolean shouldStripBundledLwjglVulkan(@NonNull String entryName) {
+    private static boolean shouldStripBundledLwjgl(
+            @NonNull String entryName,
+            boolean stripLegacyVmaShaderc
+    ) {
         String normalized = entryName.replace('\\', '/').toLowerCase(java.util.Locale.ROOT);
         int slash = normalized.lastIndexOf('/');
         String fileName = slash >= 0 ? normalized.substring(slash + 1) : normalized;
 
-        return fileName.endsWith(".jar")
-                && fileName.contains("lwjgl")
-                && fileName.contains("vulkan");
+        if (!fileName.endsWith(".jar") || !fileName.contains("lwjgl")) return false;
+
+        if (fileName.contains("vulkan")) return true;
+
+        // VulkanMod 0.5.x for Minecraft 1.20.1 was built around LWJGL 3.3.2
+        // VMA/Shaderc classes. DroidBridge launches it with the Android LWJGL
+        // 3.3.3 bridge, so the old bundled Java jars can call methods that no
+        // longer exist on the active Struct class. When the Android helper jar is
+        // installed, strip these old nested jars so Fabric resolves the helper's
+        // LWJGL 3.3.3 VMA/Shaderc artifacts instead.
+        return stripLegacyVmaShaderc
+                && (fileName.contains("vma") || fileName.contains("shaderc"));
+    }
+
+    private static boolean containsLegacy1201VulkanMod(@NonNull File[] mods) {
+        for (File mod : mods) {
+            if (isLegacy1201VulkanModJar(mod) && !isLegacy1201AndroidLibsJar(mod)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean hasLegacy1201AndroidLibs(@NonNull File[] mods) {
+        for (File mod : mods) {
+            if (isLegacy1201AndroidLibsJar(mod)) return true;
+        }
+        return false;
+    }
+
+    private static boolean isLegacy1201AndroidLibsJar(@NonNull File jarFile) {
+        String lowerName = jarFile.getName().toLowerCase(java.util.Locale.ROOT);
+        return lowerName.contains("vulkanmod")
+                && (lowerName.contains("android-libs_0.1")
+                || lowerName.contains("android-libs-0.1")
+                || lowerName.contains("an-libs"));
+    }
+
+    private static boolean isLegacy1201VulkanModJar(@NonNull File jarFile) {
+        String lowerName = jarFile.getName().toLowerCase(java.util.Locale.ROOT);
+        if (!lowerName.contains("vulkanmod") || isLegacy1201AndroidLibsJar(jarFile)) return false;
+
+        // Fast path for the common release filename.
+        if (lowerName.contains("1.20.1") && lowerName.contains("0.5.")) return true;
+
+        try {
+            String modJson = readZipEntryString(jarFile, "fabric.mod.json");
+            if (modJson == null) return false;
+
+            String compact = modJson.replace(" ", "")
+                    .replace("\n", "")
+                    .replace("\r", "")
+                    .replace("\t", "");
+            boolean isVulkanMod = compact.contains("\"id\":\"vulkanmod\"");
+            if (!isVulkanMod) return false;
+
+            String version = extractJsonStringValue(compact, "version");
+            return version.startsWith("0.5.") || compact.contains("1.20.1");
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private static void ensureLegacy1201AndroidLibs(
+            @Nullable Context context,
+            @NonNull File modsDir,
+            @NonNull File[] mods
+    ) {
+        if (hasLegacy1201AndroidLibs(mods)) {
+            appendLog("VulkanMod mitigation: legacy 1.20.1 Android LWJGL helper already present");
+            return;
+        }
+
+        if (context == null) {
+            appendLog("VulkanMod mitigation: legacy 1.20.1 VulkanMod detected but launcher context is unavailable; cannot install Android LWJGL helper");
+            return;
+        }
+
+        File target = new File(modsDir, LEGACY_1201_ANDROID_LIBS_FILE);
+        if (target.isFile() && target.length() > 0L) {
+            appendLog("VulkanMod mitigation: legacy 1.20.1 Android LWJGL helper already exists: " + target.getName());
+            return;
+        }
+
+        try (InputStream input = context.getAssets().open(LEGACY_1201_ANDROID_LIBS_ASSET);
+             FileOutputStream output = new FileOutputStream(target)) {
+            byte[] buffer = new byte[8192];
+            int read;
+            while ((read = input.read(buffer)) != -1) {
+                output.write(buffer, 0, read);
+            }
+            appendLog("VulkanMod mitigation: installed legacy 1.20.1 Android LWJGL helper: " + target.getName());
+        } catch (Throwable throwable) {
+            deleteIfExists(target);
+            appendLog("VulkanMod mitigation: legacy 1.20.1 VulkanMod needs Android LWJGL helper but asset is missing: "
+                    + LEGACY_1201_ANDROID_LIBS_ASSET
+                    + " (add " + LEGACY_1201_ANDROID_LIBS_FILE + " to app/src/main/assets/modcompat/) error="
+                    + throwable);
+        }
+    }
+
+    @Nullable
+    private static String readZipEntryString(@NonNull File jarFile, @NonNull String entryName) throws IOException {
+        try (ZipFile zipFile = new ZipFile(jarFile)) {
+            ZipEntry entry = zipFile.getEntry(entryName);
+            if (entry == null || entry.isDirectory()) return null;
+            try (InputStream input = zipFile.getInputStream(entry)) {
+                ByteArrayOutputStream output = new ByteArrayOutputStream();
+                byte[] buffer = new byte[4096];
+                int read;
+                while ((read = input.read(buffer)) != -1) {
+                    output.write(buffer, 0, read);
+                }
+                return new String(output.toByteArray(), StandardCharsets.UTF_8);
+            }
+        }
+    }
+
+    @NonNull
+    private static String extractJsonStringValue(@NonNull String compactJson, @NonNull String key) {
+        String needle = "\"" + key + "\":\"";
+        int start = compactJson.indexOf(needle);
+        if (start < 0) return "";
+        start += needle.length();
+        int end = compactJson.indexOf('"', start);
+        if (end < 0 || end <= start) return "";
+        return compactJson.substring(start, end);
     }
 
     private static void copyFile(@NonNull File source, @NonNull File target) throws IOException {

@@ -118,7 +118,18 @@ JNIEXPORT void JNICALL Java_net_kdt_pojavlaunch_utils_JREUtils_setLdLibraryPath(
 
     android_update_LD_LIBRARY_PATH = (android_update_LD_LIBRARY_PATH_t) updateLdLibPath;
     const char* ldLibPathUtf = (*env)->GetStringUTFChars(env, ldLibraryPath, 0);
-    android_update_LD_LIBRARY_PATH(ldLibPathUtf);
+
+    /*
+     * Keep the normal Android linker update, but also mirror the value into
+     * the process environment.  Some launcher paths later need to fall back to
+     * parsing LD_LIBRARY_PATH manually, especially when VMLauncher is started
+     * from a secondary activity for GUI installer jars.
+     */
+    if (android_update_LD_LIBRARY_PATH != NULL) {
+        android_update_LD_LIBRARY_PATH(ldLibPathUtf);
+    }
+    setenv("LD_LIBRARY_PATH", ldLibPathUtf, 1);
+
     (*env)->ReleaseStringUTFChars(env, ldLibraryPath, ldLibPathUtf);
 }
 

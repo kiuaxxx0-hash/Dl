@@ -137,6 +137,19 @@ public final class DriverPluginManager {
 
     @NonNull
     public static List<File> getSelectedDriverLibrarySearchPaths(@NonNull Context context, @Nullable RendererInterface renderer) {
+        return getSelectedDriverLibrarySearchPaths(
+                context,
+                renderer,
+                LauncherPreferences.isUseSystemVulkanDriver(context)
+        );
+    }
+
+    @NonNull
+    public static List<File> getSelectedDriverLibrarySearchPaths(
+            @NonNull Context context,
+            @Nullable RendererInterface renderer,
+            boolean useSystemVulkan
+    ) {
         ArrayList<File> paths = new ArrayList<>();
 
         // Driver plugins are Vulkan ICDs. Do not leak Turnip/Freedreno into LTW,
@@ -147,7 +160,7 @@ public final class DriverPluginManager {
             return paths;
         }
 
-        if (LauncherPreferences.isUseSystemVulkanDriver(context)) {
+        if (useSystemVulkan) {
             return paths;
         }
 
@@ -166,9 +179,21 @@ public final class DriverPluginManager {
 
     @NonNull
     public static Map<String, String> buildEnvironment(@NonNull Context context, @Nullable RendererInterface renderer) {
+        return buildEnvironment(
+                context,
+                renderer,
+                LauncherPreferences.isUseSystemVulkanDriver(context)
+        );
+    }
+
+    @NonNull
+    public static Map<String, String> buildEnvironment(
+            @NonNull Context context,
+            @Nullable RendererInterface renderer,
+            boolean useSystemVulkan
+    ) {
         LinkedHashMap<String, String> env = new LinkedHashMap<>();
         boolean zink = isVulkanZinkRenderer(renderer);
-        boolean useSystemVulkan = LauncherPreferences.isUseSystemVulkanDriver(context);
         Driver driver = getSelectedDriver(context);
 
         env.put("JAVA_LAUNCHER_USE_SYSTEM_VULKAN_DRIVER", useSystemVulkan ? "1" : "0");
@@ -202,6 +227,11 @@ public final class DriverPluginManager {
 
         // Explicit custom Mesa-Zink entries can still use the experimental route.
         DroidBridgeMesaSupport.applyZinkTurnipEnvironment(context, renderer, env);
+        if (useSystemVulkan) {
+            applyGlobalVulkanDriverEnvironment(context, env, driver, true, true);
+            env.put("JAVA_LAUNCHER_USE_SYSTEM_VULKAN_DRIVER", "1");
+            env.put("JAVA_LAUNCHER_VULKAN_DRIVER", SYSTEM_VULKAN_DRIVER);
+        }
         return env;
     }
 

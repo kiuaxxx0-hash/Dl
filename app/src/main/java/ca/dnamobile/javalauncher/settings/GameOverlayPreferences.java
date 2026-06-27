@@ -21,8 +21,12 @@ import androidx.annotation.Nullable;
 public final class GameOverlayPreferences {
     private static final String PREFS_NAME = "game_overlay_preferences";
     private static final boolean DEFAULT_SHOW_GAME_FPS_COUNTER = true;
+    public static final String FPS_SIZE_SMALL = "small";
+    public static final String FPS_SIZE_MEDIUM = "medium";
+    public static final String FPS_SIZE_LARGE = "large";
 
     private static final String KEY_SHOW_GAME_FPS_COUNTER = "show_game_fps_counter";
+    private static final String KEY_GAME_FPS_COUNTER_SIZE = "game_fps_counter_size";
     private static final String KEY_GAME_SETTINGS_BUTTON_PLACEMENT = "game_settings_button_placement";
     private static final String KEY_GAME_SETTINGS_BUTTON_CUSTOM_POSITION = "game_settings_button_custom_position";
     private static final String KEY_GAME_SETTINGS_BUTTON_CUSTOM_LEFT_DP = "game_settings_button_custom_left_dp";
@@ -47,6 +51,18 @@ public final class GameOverlayPreferences {
             PLACEMENT_BOTTOM_RIGHT
     };
 
+    private static final String[] FPS_SIZE_LABELS = new String[]{
+            "Small",
+            "Medium",
+            "Large"
+    };
+
+    private static final String[] FPS_SIZE_VALUES = new String[]{
+            FPS_SIZE_SMALL,
+            FPS_SIZE_MEDIUM,
+            FPS_SIZE_LARGE
+    };
+
     private GameOverlayPreferences() {
     }
 
@@ -61,6 +77,44 @@ public final class GameOverlayPreferences {
 
     public static void setShowGameFpsCounter(@NonNull Context context, boolean enabled) {
         prefs(context).edit().putBoolean(KEY_SHOW_GAME_FPS_COUNTER, enabled).apply();
+    }
+
+    @NonNull
+    public static String getGameFpsCounterSize(@NonNull Context context) {
+        return sanitizeFpsSize(prefs(context).getString(KEY_GAME_FPS_COUNTER_SIZE, FPS_SIZE_SMALL));
+    }
+
+    public static void setGameFpsCounterSize(@NonNull Context context, @Nullable String size) {
+        prefs(context).edit().putString(KEY_GAME_FPS_COUNTER_SIZE, sanitizeFpsSize(size)).apply();
+    }
+
+    @NonNull
+    public static String[] getFpsSizeLabels() {
+        return FPS_SIZE_LABELS.clone();
+    }
+
+    @NonNull
+    public static String[] getFpsSizeValues() {
+        return FPS_SIZE_VALUES.clone();
+    }
+
+    public static int indexOfFpsSize(@Nullable String size) {
+        String safe = sanitizeFpsSize(size);
+        for (int i = 0; i < FPS_SIZE_VALUES.length; i++) {
+            if (FPS_SIZE_VALUES[i].equals(safe)) return i;
+        }
+        return 0;
+    }
+
+    @NonNull
+    public static String fpsSizeValueForIndex(int index) {
+        if (index < 0 || index >= FPS_SIZE_VALUES.length) return FPS_SIZE_SMALL;
+        return FPS_SIZE_VALUES[index];
+    }
+
+    @NonNull
+    public static String getFpsSizeLabel(@NonNull Context context) {
+        return FPS_SIZE_LABELS[indexOfFpsSize(getGameFpsCounterSize(context))];
     }
 
     @NonNull
@@ -128,6 +182,14 @@ public final class GameOverlayPreferences {
     public static String placementValueForIndex(int index) {
         if (index < 0 || index >= PLACEMENT_VALUES.length) return PLACEMENT_BOTTOM_RIGHT;
         return PLACEMENT_VALUES[index];
+    }
+
+    @NonNull
+    private static String sanitizeFpsSize(@Nullable String size) {
+        if (FPS_SIZE_MEDIUM.equals(size) || FPS_SIZE_LARGE.equals(size)) {
+            return size;
+        }
+        return FPS_SIZE_SMALL;
     }
 
     @NonNull

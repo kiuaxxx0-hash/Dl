@@ -478,3 +478,101 @@ bool patch_elf_soname(int patchfd, int realfd, uint16_t patchid) {
     munmap(target, realstat.st_size);
     return false;
 }
+
+
+static bool patch_elf_soname_to_name(int patchfd, int realfd, const char* replacement_soname) {
+    if (replacement_soname == NULL || replacement_soname[0] == '\0') return false;
+
+    struct stat realstat;
+    if (fstat(realfd, &realstat))
+        return false;
+
+    if (ftruncate64(patchfd, realstat.st_size) == -1)
+        return false;
+
+    char* target = mmap(NULL, realstat.st_size, PROT_READ | PROT_WRITE, MAP_SHARED, patchfd, 0);
+    if (!target)
+        return false;
+
+    if (read(realfd, target, realstat.st_size) != realstat.st_size) {
+        munmap(target, realstat.st_size);
+        return false;
+    }
+    close(realfd);
+
+    ELF_EHDR *ehdr = (ELF_EHDR*)target;
+    ELF_SHDR *shdr = (ELF_SHDR*)(target + ehdr->e_shoff);
+    for (ELF_HALF i = 0; i < ehdr->e_shnum; i++) {
+        ELF_SHDR *hdr = &shdr[i];
+        if (hdr->sh_type == SHT_DYNAMIC) {
+            char* strtab = target + shdr[hdr->sh_link].sh_offset;
+            ELF_DYN *dynEntries = (ELF_DYN*)(target + hdr->sh_offset);
+            for (ELF_XWORD k = 0; k < (hdr->sh_size / hdr->sh_entsize); k++) {
+                ELF_DYN* dynEntry = &dynEntries[k];
+                if (dynEntry->d_tag == DT_SONAME) {
+                    char* soname = strtab + dynEntry->d_un.d_val;
+                    size_t old_len = strlen(soname);
+                    size_t new_len = strlen(replacement_soname);
+                    if (new_len > old_len) {
+                        ns_log("replacement SONAME '%s' is longer than original '%s'", replacement_soname, soname);
+                        munmap(target, realstat.st_size);
+                        return false;
+                    }
+                    memset(soname, 0, old_len);
+                    memcpy(soname, replacement_soname, new_len);
+                    munmap(target, realstat.st_size);
+                    return true;
+                }
+            }
+        }
+    }
+    munmap(target, realstat.st_size);
+    return false;
+}
+
+void* linker_ns_dlopen_unique_named(const char* tmpdir, const char* name, const char* unique_soname, int flags) {
+#ifdef ADRENO_POSSIBLE
+    if (tmpdir == NULL || tmpdir[0] == '\0' || name == NULL || name[0] == '\0' || unique_soname == NULL || unique_soname[0] == '\0') {
+        ns_log("linker_ns_dlopen_unique_named invalid args tmpdir=%s name=%s unique=%s",
+               tmpdir ? tmpdir : "<null>", name ? name : "<null>", unique_soname ? unique_soname : "<null>");
+        return NULL;
+    }
+
+    char pathbuf[PATH_MAX];
+    int patch_fd, real_fd;
+    snprintf(pathbuf, PATH_MAX, "%s/%s", tmpdir, unique_soname);
+    unlink(pathbuf);
+    patch_fd = open(pathbuf, O_CREAT | O_TRUNC | O_RDWR, S_IRUSR | S_IWUSR);
+    if (patch_fd == -1) {
+        ns_log("failed creating unique alias %s", pathbuf);
+        return NULL;
+    }
+
+    snprintf(pathbuf, PATH_MAX, "%s/%s", SEARCH_PATH, name);
+    real_fd = open(pathbuf, O_RDONLY);
+    if (real_fd == -1) {
+        close(patch_fd);
+        ns_log("failed opening system loader source %s", pathbuf);
+        return NULL;
+    }
+
+    if (!patch_elf_soname_to_name(patch_fd, real_fd, unique_soname)) {
+        close(patch_fd);
+        close(real_fd);
+        ns_log("failed patching SONAME for %s -> %s", name, unique_soname);
+        return NULL;
+    }
+
+    android_dlextinfo extinfo = {
+        .flags = ANDROID_DLEXT_USE_NAMESPACE | ANDROID_DLEXT_USE_LIBRARY_FD,
+        .library_fd = patch_fd,
+        .library_namespace = driver_namespace
+    };
+    snprintf(pathbuf, PATH_MAX, "/proc/self/fd/%d", patch_fd);
+    void* handle = android_dlopen_ext(pathbuf, flags, &extinfo);
+    ns_log("linker_ns_dlopen_unique_named source=%s unique=%s handle=%p", name, unique_soname, handle);
+    return handle;
+#else
+    return NULL;
+#endif
+}

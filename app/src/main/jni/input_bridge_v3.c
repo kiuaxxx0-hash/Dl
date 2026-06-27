@@ -52,7 +52,84 @@
 #define EVENT_TYPE_SCROLL 1007
 #define EVENT_TYPE_WINDOW_SIZE 1008
 
+#define BTA_GAMEPAD_BUTTON_COUNT 15
+#define BTA_GAMEPAD_AXIS_COUNT 6
+
+static volatile int bta_gamepad_present = 1;
+static volatile int bta_gamepad_device_id = -1;
+static char bta_gamepad_name[192] = "DroidBridge Android Controller";
+static char bta_gamepad_guid[33] = "030000005e0400008e02000014010000";
+static float bta_gamepad_axes[BTA_GAMEPAD_AXIS_COUNT] = {0.0f, 0.0f, 0.0f, 0.0f, -1.0f, -1.0f};
+static unsigned char bta_gamepad_buttons[BTA_GAMEPAD_BUTTON_COUNT] = {0};
+static unsigned char bta_gamepad_hat = 0;
+
+static void bta_copy_jstring(JNIEnv *env, jstring src, char *dst, size_t dst_size, const char *fallback) {
+    if (dst == NULL || dst_size == 0) return;
+    const char *value = NULL;
+    if (src != NULL) {
+        value = (*env)->GetStringUTFChars(env, src, NULL);
+    }
+    if (value == NULL || value[0] == '\0') {
+        value = fallback != NULL ? fallback : "DroidBridge Android Controller";
+        snprintf(dst, dst_size, "%s", value);
+    } else {
+        snprintf(dst, dst_size, "%s", value);
+    }
+    if (src != NULL && value != NULL && value != fallback) {
+        (*env)->ReleaseStringUTFChars(env, src, value);
+    }
+}
+
+static void bta_set_identity(JNIEnv *env, jint deviceId, jstring name, jstring descriptor) {
+    bta_gamepad_present = 1;
+    bta_gamepad_device_id = deviceId;
+    bta_copy_jstring(env, name, bta_gamepad_name, sizeof(bta_gamepad_name), "DroidBridge Android Controller");
+    // Use a stable Xbox 360 SDL GUID so BTA's gamepad mapping layer accepts the controller.
+    // The visible name still comes from the real Android InputDevice.
+    snprintf(bta_gamepad_guid, sizeof(bta_gamepad_guid), "%s", "030000005e0400008e02000014010000");
+    __android_log_print(ANDROID_LOG_INFO, "BTAControllerBridge", "identity id=%d name=%s guid=%s", deviceId, bta_gamepad_name, bta_gamepad_guid);
+}
+
+static float bta_clampf(float v) {
+    if (isnan(v) || isinf(v)) return 0.0f;
+    if (v < -1.0f) return -1.0f;
+    if (v > 1.0f) return 1.0f;
+    return v;
+}
+
+static float bta_trigger_to_glfw(float v) {
+    if (isnan(v) || isinf(v)) v = 0.0f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 1.0f) v = 1.0f;
+    return (v * 2.0f) - 1.0f;
+}
+
+static int bta_android_key_to_gamepad_button(jint keyCode) {
+    switch (keyCode) {
+        case 96: return 0;   // A
+        case 97: return 1;   // B
+        case 99: return 2;   // X
+        case 100: return 3;  // Y
+        case 102: return 4;  // L1
+        case 103: return 5;  // R1
+        case 104: return -1; // L2 is an axis only; do not mirror it to LB/hotbar
+        case 105: return -1; // R2 is an axis only; do not mirror it to RB/hotbar
+        case 109: return 6;  // SELECT/BACK
+        case 108: return 7;  // START
+        case 110: return 8;  // MODE/GUIDE
+        case 106: return 9;  // L3
+        case 107: return 10; // R3
+        case 19: return 11;  // DPAD_UP
+        case 22: return 12;  // DPAD_RIGHT
+        case 20: return 13;  // DPAD_DOWN
+        case 21: return 14;  // DPAD_LEFT
+        case 23: return 0;   // DPAD_CENTER -> A
+        default: return -1;
+    }
+}
+
 static void registerFunctions(JNIEnv *env);
+static void registerBtaGamepadFunctions(JNIEnv *env);
 
 jint JNI_OnLoad(JavaVM* vm, __attribute__((unused)) void* reserved) {
     if (pojav_environ->dalvikJavaVMPtr == NULL) {
@@ -63,6 +140,8 @@ jint JNI_OnLoad(JavaVM* vm, __attribute__((unused)) void* reserved) {
         pojav_environ->bridgeClazz = (*pojav_environ->dalvikJNIEnvPtr_ANDROID)->NewGlobalRef(pojav_environ->dalvikJNIEnvPtr_ANDROID,(*pojav_environ->dalvikJNIEnvPtr_ANDROID) ->FindClass(pojav_environ->dalvikJNIEnvPtr_ANDROID,"org/lwjgl/glfw/CallbackBridge"));
         pojav_environ->method_accessAndroidClipboard = (*pojav_environ->dalvikJNIEnvPtr_ANDROID)->GetStaticMethodID(pojav_environ->dalvikJNIEnvPtr_ANDROID, pojav_environ->bridgeClazz, "accessAndroidClipboard", "(ILjava/lang/String;)Ljava/lang/String;");
         pojav_environ->method_onGrabStateChanged = (*pojav_environ->dalvikJNIEnvPtr_ANDROID)->GetStaticMethodID(pojav_environ->dalvikJNIEnvPtr_ANDROID, pojav_environ->bridgeClazz, "onGrabStateChanged", "(Z)V");
+        pojav_environ->method_onCursorShapeChanged = (*pojav_environ->dalvikJNIEnvPtr_ANDROID)->GetStaticMethodID(pojav_environ->dalvikJNIEnvPtr_ANDROID, pojav_environ->bridgeClazz, "onCursorShapeChanged", "(I)V");
+        pojav_environ->method_onNativeCursorPosSilentlyChanged = (*pojav_environ->dalvikJNIEnvPtr_ANDROID)->GetStaticMethodID(pojav_environ->dalvikJNIEnvPtr_ANDROID, pojav_environ->bridgeClazz, "onNativeCursorPosSilentlyChanged", "(FF)V");
         pojav_environ->isUseStackQueueCall = JNI_FALSE;
     } else if (pojav_environ->dalvikJavaVMPtr != vm) {
         __android_log_print(ANDROID_LOG_INFO, "Native", "Saving JVM environ...");
@@ -80,6 +159,11 @@ jint JNI_OnLoad(JavaVM* vm, __attribute__((unused)) void* reserved) {
         hookExec();
         installLwjglDlopenHook();
         installEMUIIteratorMititgation();
+
+        // Register the BTA-only gamepad native readers in the OpenJDK/LWJGL JVM.
+        // Android button/axis events are written from the Dalvik side through CallbackBridge,
+        // while BTA polls gamepad state from the OpenJDK side through DroidBridgeBtaGamepad.
+        registerBtaGamepadFunctions(pojav_environ->runtimeJNIEnvPtr_JRE);
 
         // Disable SDL3 HIDAPI joystick backend to prevent double detection.
         // When both HIDAPI and the Android Input API backend are active, they can both detect
@@ -132,6 +216,103 @@ ADD_CALLBACK_WWIN(Scroll)
 ADD_CALLBACK_WWIN(WindowSize)
 
 #undef ADD_CALLBACK_WWIN
+
+#define GLFW_ARROW_CURSOR 0x00036001
+#define GLFW_IBEAM_CURSOR 0x00036002
+#define DROIDBRIDGE_CURSOR_HANDLE_MAGIC ((jlong)0x4442435500000000ULL)
+
+static jint cursor_shape_from_handle(jlong cursor) {
+    if (cursor == 0) return GLFW_ARROW_CURSOR;
+    if ((cursor & (jlong)0xffffffff00000000ULL) == DROIDBRIDGE_CURSOR_HANDLE_MAGIC) {
+        return (jint)(cursor & 0xffffffffLL);
+    }
+    return GLFW_ARROW_CURSOR;
+}
+
+static JNIEnv* get_attached_dalvik_env(void) {
+    if (pojav_environ == NULL || pojav_environ->dalvikJavaVMPtr == NULL) return NULL;
+
+    JNIEnv *dalvikEnv = NULL;
+    jint env_result = (*pojav_environ->dalvikJavaVMPtr)->GetEnv(
+            pojav_environ->dalvikJavaVMPtr,
+            (void**) &dalvikEnv,
+            JNI_VERSION_1_4
+    );
+    if (env_result == JNI_EDETACHED) {
+        env_result = (*pojav_environ->dalvikJavaVMPtr)->AttachCurrentThread(
+                pojav_environ->dalvikJavaVMPtr,
+                (void**) &dalvikEnv,
+                NULL
+        );
+    }
+    if (env_result != JNI_OK) return NULL;
+    return dalvikEnv;
+}
+
+static void notify_android_cursor_shape(jint shape) {
+    if (pojav_environ == NULL
+            || pojav_environ->bridgeClazz == NULL
+            || pojav_environ->method_onCursorShapeChanged == NULL) {
+        return;
+    }
+
+    JNIEnv *dalvikEnv = get_attached_dalvik_env();
+    if (dalvikEnv == NULL) return;
+
+    (*dalvikEnv)->CallStaticVoidMethod(
+            dalvikEnv,
+            pojav_environ->bridgeClazz,
+            pojav_environ->method_onCursorShapeChanged,
+            shape
+    );
+    if ((*dalvikEnv)->ExceptionCheck(dalvikEnv)) {
+        (*dalvikEnv)->ExceptionClear(dalvikEnv);
+    }
+}
+
+static void notify_android_cursor_pos_silently(jfloat x, jfloat y) {
+    if (pojav_environ == NULL
+            || pojav_environ->bridgeClazz == NULL
+            || pojav_environ->method_onNativeCursorPosSilentlyChanged == NULL) {
+        return;
+    }
+
+    JNIEnv *dalvikEnv = get_attached_dalvik_env();
+    if (dalvikEnv == NULL) return;
+
+    (*dalvikEnv)->CallStaticVoidMethod(
+            dalvikEnv,
+            pojav_environ->bridgeClazz,
+            pojav_environ->method_onNativeCursorPosSilentlyChanged,
+            x,
+            y
+    );
+    if ((*dalvikEnv)->ExceptionCheck(dalvikEnv)) {
+        (*dalvikEnv)->ExceptionClear(dalvikEnv);
+    }
+}
+
+JNIEXPORT jlong JNICALL Java_org_lwjgl_glfw_GLFW_nglfwCreateStandardCursor(
+        __attribute__((unused)) JNIEnv* env,
+        __attribute__((unused)) jclass clazz,
+        jint shape) {
+    return (jlong)(DROIDBRIDGE_CURSOR_HANDLE_MAGIC | ((jlong) shape & 0xffffffffLL));
+}
+
+JNIEXPORT void JNICALL Java_org_lwjgl_glfw_GLFW_nglfwDestroyCursor(
+        __attribute__((unused)) JNIEnv* env,
+        __attribute__((unused)) jclass clazz,
+        __attribute__((unused)) jlong cursor) {
+    // Android has no native desktop cursor object to destroy.
+}
+
+JNIEXPORT void JNICALL Java_org_lwjgl_glfw_GLFW_nglfwSetCursor(
+        __attribute__((unused)) JNIEnv* env,
+        __attribute__((unused)) jclass clazz,
+        __attribute__((unused)) jlong window,
+        jlong cursor) {
+    notify_android_cursor_shape(cursor_shape_from_handle(cursor));
+}
 
 void handleFramebufferSizeJava(long window, int w, int h) {
     (*pojav_environ->runtimeJNIEnvPtr_JRE)->CallStaticVoidMethod(pojav_environ->runtimeJNIEnvPtr_JRE, pojav_environ->vmGlfwClass, pojav_environ->method_internalWindowSizeChanged, (long)window, w, h);
@@ -240,6 +421,7 @@ JNIEXPORT void JNICALL JavaCritical_org_lwjgl_glfw_GLFW_glfwSetCursorPos(__attri
         jdouble ypos) {
 pojav_environ->cLastX = pojav_environ->cursorX = xpos;
 pojav_environ->cLastY = pojav_environ->cursorY = ypos;
+notify_android_cursor_pos_silently((jfloat)xpos, (jfloat)ypos);
 }
 
 JNIEXPORT void JNICALL
@@ -306,12 +488,14 @@ void critical_set_stackqueue(jboolean use_input_stack_queue) {
 }
 // Cursor shapes are desktop-only. Android has no native cursor to change.
 void critical_set_cursor_shape(jint shape) {
-    (void) shape; // no-op
+    // Critical-native path cannot safely call back into Java. The non-critical
+    // GLFW cursor hooks below are the normal path used by Minecraft menus.
+    (void) shape;
 }
 void noncritical_set_cursor_shape(__attribute__((unused)) JNIEnv* env,
                                   __attribute__((unused)) jclass clazz,
                                   jint shape) {
-    (void) shape; // no-op
+    notify_android_cursor_shape(shape);
 }
 
 void noncritical_set_stackqueue(__attribute__((unused)) JNIEnv *env, __attribute__((unused)) jclass clazz, jboolean use_input_stack_queue) {
@@ -361,8 +545,7 @@ JNIEXPORT jstring JNICALL Java_org_lwjgl_glfw_CallbackBridge_nativeClipboard(JNI
 JNIEXPORT void JNICALL
 Java_org_lwjgl_glfw_CallbackBridge_nativeSetCursorShape(JNIEnv* env, jclass clazz, jint shape) {
 (void)env; (void)clazz;
-// Desktop cursor shapes don’t exist on Android, so just ignore.
-(void)shape;
+notify_android_cursor_shape(shape);
 }
 
 JNIEXPORT jboolean JNICALL JavaCritical_org_lwjgl_glfw_CallbackBridge_nativeSetInputReady(jboolean inputReady) {
@@ -461,6 +644,24 @@ void critical_send_cursor_pos(jfloat x, jfloat y) {
 
 void noncritical_send_cursor_pos(__attribute__((unused)) JNIEnv* env, __attribute__((unused)) jclass clazz,  jfloat x, jfloat y) {
     critical_send_cursor_pos(x, y);
+}
+
+void critical_set_cursor_pos_silently(jfloat x, jfloat y) {
+    if (pojav_environ == NULL) return;
+
+    // Reset both the live cursor and the last-pumped cursor cache without
+    // invoking GLFW_invoke_CursorPos and without setting shouldUpdateMouse.
+    // This is used on GUI -> grabbed transitions so the last menu cursor
+    // position cannot be interpreted as a giant first camera-look delta.
+    pojav_environ->cursorX = x;
+    pojav_environ->cursorY = y;
+    pojav_environ->cLastX = x;
+    pojav_environ->cLastY = y;
+    pojav_environ->shouldUpdateMouse = false;
+}
+
+void noncritical_set_cursor_pos_silently(__attribute__((unused)) JNIEnv* env, __attribute__((unused)) jclass clazz, jfloat x, jfloat y) {
+    critical_set_cursor_pos_silently(x, y);
 }
 #define max(a,b) \
    ({ __typeof__ (a) _a = (a); \
@@ -571,6 +772,184 @@ pojav_environ->method_glftSetWindowAttrib,
 
 // Attaching every time is annoying, so stick the attachment to the Android GUI thread around
 }
+
+JNIEXPORT void JNICALL Java_org_lwjgl_glfw_CallbackBridge_nativeBtaSetGamepadPresent(
+        __attribute__((unused)) JNIEnv* env,
+        __attribute__((unused)) jclass clazz,
+        jboolean present) {
+    bta_gamepad_present = present ? 1 : 0;
+    __android_log_print(ANDROID_LOG_INFO, "BTAControllerBridge", "set present=%d", bta_gamepad_present);
+}
+
+JNIEXPORT void JNICALL Java_org_lwjgl_glfw_CallbackBridge_nativeBtaSetGamepadIdentity(
+        JNIEnv* env,
+        __attribute__((unused)) jclass clazz,
+        jint deviceId,
+        jstring name,
+        jstring descriptor) {
+    bta_set_identity(env, deviceId, name, descriptor);
+}
+
+JNIEXPORT void JNICALL Java_org_lwjgl_glfw_CallbackBridge_nativeBtaSetGamepadMotion(
+        JNIEnv* env,
+        __attribute__((unused)) jclass clazz,
+        jint deviceId,
+        jstring name,
+        jstring descriptor,
+        jfloat leftX,
+        jfloat leftY,
+        jfloat rightX,
+        jfloat rightY,
+        jfloat leftTrigger,
+        jfloat rightTrigger,
+        jboolean hatUp,
+        jboolean hatRight,
+        jboolean hatDown,
+        jboolean hatLeft) {
+    bta_set_identity(env, deviceId, name, descriptor);
+
+    bta_gamepad_axes[0] = bta_clampf(leftX);
+    bta_gamepad_axes[1] = bta_clampf(leftY);
+    bta_gamepad_axes[2] = bta_clampf(rightX);
+    bta_gamepad_axes[3] = bta_clampf(rightY);
+    bta_gamepad_axes[4] = bta_trigger_to_glfw(leftTrigger);
+    bta_gamepad_axes[5] = bta_trigger_to_glfw(rightTrigger);
+
+    unsigned char hat = 0;
+    if (hatUp) hat |= 1;
+    if (hatRight) hat |= 2;
+    if (hatDown) hat |= 4;
+    if (hatLeft) hat |= 8;
+    bta_gamepad_hat = hat;
+
+    bta_gamepad_buttons[11] = hatUp ? 1 : 0;
+    bta_gamepad_buttons[12] = hatRight ? 1 : 0;
+    bta_gamepad_buttons[13] = hatDown ? 1 : 0;
+    bta_gamepad_buttons[14] = hatLeft ? 1 : 0;
+}
+
+JNIEXPORT void JNICALL Java_org_lwjgl_glfw_CallbackBridge_nativeBtaSetGamepadButton(
+        JNIEnv* env,
+        __attribute__((unused)) jclass clazz,
+        jint deviceId,
+        jstring name,
+        jstring descriptor,
+        jint androidKeyCode,
+        jboolean down) {
+    bta_set_identity(env, deviceId, name, descriptor);
+    if (androidKeyCode == 104) { // KEYCODE_BUTTON_L2
+        bta_gamepad_axes[4] = down ? 1.0f : -1.0f;
+    } else if (androidKeyCode == 105) { // KEYCODE_BUTTON_R2
+        bta_gamepad_axes[5] = down ? 1.0f : -1.0f;
+    }
+
+    int button = bta_android_key_to_gamepad_button(androidKeyCode);
+    if (button >= 0 && button < BTA_GAMEPAD_BUTTON_COUNT) {
+        bta_gamepad_buttons[button] = down ? 1 : 0;
+        __android_log_print(ANDROID_LOG_INFO, "BTAControllerBridge", "button key=%d mapped=%d down=%d", androidKeyCode, button, down ? 1 : 0);
+    } else {
+        __android_log_print(ANDROID_LOG_INFO, "BTAControllerBridge", "button key=%d unmapped down=%d", androidKeyCode, down ? 1 : 0);
+    }
+}
+
+JNIEXPORT jboolean JNICALL Java_org_lwjgl_glfw_DroidBridgeBtaGamepad_nativeIsPresent(
+        __attribute__((unused)) JNIEnv* env,
+        __attribute__((unused)) jclass clazz,
+        jint jid) {
+    return (jid == 0 && bta_gamepad_present) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jstring JNICALL Java_org_lwjgl_glfw_DroidBridgeBtaGamepad_nativeName(
+        JNIEnv* env,
+        __attribute__((unused)) jclass clazz,
+        jint jid) {
+    if (jid != 0 || !bta_gamepad_present) return NULL;
+    return (*env)->NewStringUTF(env, bta_gamepad_name);
+}
+
+JNIEXPORT jstring JNICALL Java_org_lwjgl_glfw_DroidBridgeBtaGamepad_nativeGuid(
+        JNIEnv* env,
+        __attribute__((unused)) jclass clazz,
+        jint jid) {
+    if (jid != 0 || !bta_gamepad_present) return NULL;
+    return (*env)->NewStringUTF(env, bta_gamepad_guid);
+}
+
+JNIEXPORT jboolean JNICALL Java_org_lwjgl_glfw_DroidBridgeBtaGamepad_nativeReadAxes(
+        JNIEnv* env,
+        __attribute__((unused)) jclass clazz,
+        jint jid,
+        jobject outBuffer) {
+    if (jid != 0 || !bta_gamepad_present || outBuffer == NULL) return JNI_FALSE;
+    float *out = (float*) (*env)->GetDirectBufferAddress(env, outBuffer);
+    if (out == NULL) return JNI_FALSE;
+    for (int i = 0; i < BTA_GAMEPAD_AXIS_COUNT; i++) out[i] = bta_gamepad_axes[i];
+    return JNI_TRUE;
+}
+
+JNIEXPORT jboolean JNICALL Java_org_lwjgl_glfw_DroidBridgeBtaGamepad_nativeReadButtons(
+        JNIEnv* env,
+        __attribute__((unused)) jclass clazz,
+        jint jid,
+        jobject outBuffer) {
+    if (jid != 0 || !bta_gamepad_present || outBuffer == NULL) return JNI_FALSE;
+    unsigned char *out = (unsigned char*) (*env)->GetDirectBufferAddress(env, outBuffer);
+    if (out == NULL) return JNI_FALSE;
+    for (int i = 0; i < BTA_GAMEPAD_BUTTON_COUNT; i++) out[i] = bta_gamepad_buttons[i];
+    return JNI_TRUE;
+}
+
+JNIEXPORT jboolean JNICALL Java_org_lwjgl_glfw_DroidBridgeBtaGamepad_nativeReadHats(
+        JNIEnv* env,
+        __attribute__((unused)) jclass clazz,
+        jint jid,
+        jobject outBuffer) {
+    if (jid != 0 || !bta_gamepad_present || outBuffer == NULL) return JNI_FALSE;
+    unsigned char *out = (unsigned char*) (*env)->GetDirectBufferAddress(env, outBuffer);
+    if (out == NULL) return JNI_FALSE;
+    out[0] = bta_gamepad_hat;
+    return JNI_TRUE;
+}
+
+static void registerBtaGamepadFunctions(JNIEnv *env) {
+    if (env == NULL) return;
+
+    jclass gamepad_class = (*env)->FindClass(env, "org/lwjgl/glfw/DroidBridgeBtaGamepad");
+    if (gamepad_class == NULL) {
+        if ((*env)->ExceptionCheck(env)) {
+            (*env)->ExceptionClear(env);
+        }
+        __android_log_print(ANDROID_LOG_WARN, "BTAControllerBridge", "DroidBridgeBtaGamepad class not found in runtime JVM yet");
+        return;
+    }
+
+    static const JNINativeMethod bta_gamepad_fcns[] = {
+            {"nativeIsPresent", "(I)Z", (void*) Java_org_lwjgl_glfw_DroidBridgeBtaGamepad_nativeIsPresent},
+            {"nativeName", "(I)Ljava/lang/String;", (void*) Java_org_lwjgl_glfw_DroidBridgeBtaGamepad_nativeName},
+            {"nativeGuid", "(I)Ljava/lang/String;", (void*) Java_org_lwjgl_glfw_DroidBridgeBtaGamepad_nativeGuid},
+            {"nativeReadAxes", "(ILjava/nio/FloatBuffer;)Z", (void*) Java_org_lwjgl_glfw_DroidBridgeBtaGamepad_nativeReadAxes},
+            {"nativeReadButtons", "(ILjava/nio/ByteBuffer;)Z", (void*) Java_org_lwjgl_glfw_DroidBridgeBtaGamepad_nativeReadButtons},
+            {"nativeReadHats", "(ILjava/nio/ByteBuffer;)Z", (void*) Java_org_lwjgl_glfw_DroidBridgeBtaGamepad_nativeReadHats},
+    };
+
+    jint result = (*env)->RegisterNatives(
+            env,
+            gamepad_class,
+            bta_gamepad_fcns,
+            sizeof(bta_gamepad_fcns) / sizeof(bta_gamepad_fcns[0])
+    );
+
+    if (result == 0) {
+        __android_log_print(ANDROID_LOG_INFO, "BTAControllerBridge", "registered DroidBridgeBtaGamepad runtime native readers");
+    } else {
+        if ((*env)->ExceptionCheck(env)) {
+            (*env)->ExceptionDescribe(env);
+            (*env)->ExceptionClear(env);
+        }
+        __android_log_print(ANDROID_LOG_ERROR, "BTAControllerBridge", "failed registering DroidBridgeBtaGamepad natives result=%d", result);
+    }
+}
+
 const static JNINativeMethod critical_fcns[] = {
         {"nativeSetUseInputStackQueue", "(Z)V", critical_set_stackqueue},
         {"nativeSetCursorShape", "(I)V", critical_set_cursor_shape},
@@ -579,9 +958,14 @@ const static JNINativeMethod critical_fcns[] = {
         {"nativeSendCharMods", "(CI)Z", critical_send_char_mods},
         {"nativeSendKey", "(IIII)V", critical_send_key},
         {"nativeSendCursorPos", "(FF)V", critical_send_cursor_pos},
+        {"nativeSetCursorPosSilently", "(FF)V", critical_set_cursor_pos_silently},
         {"nativeSendMouseButton", "(III)V", critical_send_mouse_button},
         {"nativeSendScroll", "(DD)V", critical_send_scroll},
-        {"nativeSendScreenSize", "(II)V", critical_send_screen_size}
+        {"nativeSendScreenSize", "(II)V", critical_send_screen_size},
+        {"nativeBtaSetGamepadPresent", "(Z)V", Java_org_lwjgl_glfw_CallbackBridge_nativeBtaSetGamepadPresent},
+        {"nativeBtaSetGamepadIdentity", "(ILjava/lang/String;Ljava/lang/String;)V", Java_org_lwjgl_glfw_CallbackBridge_nativeBtaSetGamepadIdentity},
+        {"nativeBtaSetGamepadMotion", "(ILjava/lang/String;Ljava/lang/String;FFFFFFZZZZ)V", Java_org_lwjgl_glfw_CallbackBridge_nativeBtaSetGamepadMotion},
+        {"nativeBtaSetGamepadButton", "(ILjava/lang/String;Ljava/lang/String;IZ)V", Java_org_lwjgl_glfw_CallbackBridge_nativeBtaSetGamepadButton},
 };
 
 const static JNINativeMethod noncritical_fcns[] = {
@@ -591,9 +975,14 @@ const static JNINativeMethod noncritical_fcns[] = {
         {"nativeSendCharMods", "(CI)Z", noncritical_send_char_mods},
         {"nativeSendKey", "(IIII)V", noncritical_send_key},
         {"nativeSendCursorPos", "(FF)V", noncritical_send_cursor_pos},
+        {"nativeSetCursorPosSilently", "(FF)V", noncritical_set_cursor_pos_silently},
         {"nativeSendMouseButton", "(III)V", noncritical_send_mouse_button},
         {"nativeSendScroll", "(DD)V", noncritical_send_scroll},
-        {"nativeSendScreenSize", "(II)V", noncritical_send_screen_size}
+        {"nativeSendScreenSize", "(II)V", noncritical_send_screen_size},
+        {"nativeBtaSetGamepadPresent", "(Z)V", Java_org_lwjgl_glfw_CallbackBridge_nativeBtaSetGamepadPresent},
+        {"nativeBtaSetGamepadIdentity", "(ILjava/lang/String;Ljava/lang/String;)V", Java_org_lwjgl_glfw_CallbackBridge_nativeBtaSetGamepadIdentity},
+        {"nativeBtaSetGamepadMotion", "(ILjava/lang/String;Ljava/lang/String;FFFFFFZZZZ)V", Java_org_lwjgl_glfw_CallbackBridge_nativeBtaSetGamepadMotion},
+        {"nativeBtaSetGamepadButton", "(ILjava/lang/String;Ljava/lang/String;IZ)V", Java_org_lwjgl_glfw_CallbackBridge_nativeBtaSetGamepadButton},
 };
 
 

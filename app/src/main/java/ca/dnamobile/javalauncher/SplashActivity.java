@@ -43,8 +43,10 @@ public class SplashActivity extends AppCompatActivity {
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        LauncherTheme.apply(this);
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_splash);
+        LauncherTheme.applyRainbowBackgroundIfNeeded(this);
 
         titleText = findViewById(R.id.textTitle);
         statusText = findViewById(R.id.textStatus);

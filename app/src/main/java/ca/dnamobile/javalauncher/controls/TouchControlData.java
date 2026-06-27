@@ -63,6 +63,7 @@ public final class TouchControlData {
     public boolean visibleWhenControlsHidden;
     public boolean joystickAbsolute;
     public boolean joystickForwardLock;
+    public float joystickDeadzonePercent = 16f;
 
     @Nullable public String rawX;
     @Nullable public String rawY;
@@ -137,6 +138,7 @@ public final class TouchControlData {
         copy.visibleWhenControlsHidden = visibleWhenControlsHidden;
         copy.joystickAbsolute = joystickAbsolute;
         copy.joystickForwardLock = joystickForwardLock;
+        copy.joystickDeadzonePercent = joystickDeadzonePercent;
         copy.rawX = rawX;
         copy.rawY = rawY;
         return copy;
@@ -173,6 +175,7 @@ public final class TouchControlData {
         json.put("visibleWhenControlsHidden", visibleWhenControlsHidden);
         json.put("joystickAbsolute", joystickAbsolute);
         json.put("joystickForwardLock", joystickForwardLock);
+        json.put("joystickDeadzonePercent", joystickDeadzonePercent);
         if (rawX != null) json.put("rawX", rawX);
         if (rawY != null) json.put("rawY", rawY);
         return json;
@@ -206,6 +209,7 @@ public final class TouchControlData {
         data.visibleWhenControlsHidden = readVisibleWhenControlsHidden(json, data.action);
         data.joystickAbsolute = json.optBoolean("joystickAbsolute", json.optBoolean("absolute", data.joystickAbsolute));
         data.joystickForwardLock = json.optBoolean("joystickForwardLock", json.optBoolean("forwardLock", data.joystickForwardLock));
+        data.joystickDeadzonePercent = clampJoystickDeadzonePercent((float) json.optDouble("joystickDeadzonePercent", json.optDouble("deadzone", json.optDouble("deadzonePercent", data.joystickDeadzonePercent))));
         data.rawX = optNullableString(json, "rawX", optNullableString(json, "dynamicX", null));
         data.rawY = optNullableString(json, "rawY", optNullableString(json, "dynamicY", null));
         return data;
@@ -260,6 +264,7 @@ public final class TouchControlData {
         data.rawY = optNullableString(json, "dynamicY", null);
         data.joystickAbsolute = json.optBoolean("absolute", false);
         data.joystickForwardLock = json.optBoolean("forwardLock", false);
+        data.joystickDeadzonePercent = clampJoystickDeadzonePercent((float) json.optDouble("joystickDeadzonePercent", json.optDouble("deadzone", json.optDouble("deadzonePercent", data.joystickDeadzonePercent))));
         return data;
     }
 
@@ -415,6 +420,10 @@ public final class TouchControlData {
 
     private static float clampSizePercent(float value) {
         return Math.max(30f, Math.min(250f, value));
+    }
+
+    public static float clampJoystickDeadzonePercent(float value) {
+        return Math.max(0f, Math.min(80f, value));
     }
 
     private static void applyImportedKey(@NonNull TouchControlData data, int key, @NonNull int[] allKeys) {

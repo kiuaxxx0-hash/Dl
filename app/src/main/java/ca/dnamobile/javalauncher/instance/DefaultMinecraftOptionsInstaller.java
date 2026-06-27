@@ -20,6 +20,9 @@ import androidx.annotation.Nullable;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.text.SimpleDateFormat;
+import java.util.Date;
 import java.util.Locale;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -27,7 +30,18 @@ import java.util.regex.Pattern;
 import ca.dnamobile.javalauncher.feature.log.Logging;
 
 /**
- * Seeds a small Android-friendly options.txt for new instances only.
+ * Seeds a small Android-friendly options.txt for clean launcher-created instances only.
+ *
+ * Important policy:
+ * - Never overwrite an existing options.txt.
+ * - Never seed into a non-empty game directory unless explicitly allowed.
+ * - Never keep re-seeding after the instance has already made a decision once.
+ *
+ * This protects:
+ * - modpack-provided options.txt
+ * - copied options.txt from another instance
+ * - options.txt edited by Minecraft while the user is in-game
+ * - users who intentionally delete options.txt and want Minecraft to recreate it
  *
  * Asset files must be stored in:
  * app/src/main/assets/minecraft_defaults/
@@ -43,6 +57,11 @@ public final class DefaultMinecraftOptionsInstaller {
     private static final String ASSET_BETA_LEGACY = "minecraft_defaults/options-beta-legacy-optional.txt";
     private static final String ASSET_RELEASE_1_8_TO_1_16 = "minecraft_defaults/options-release-1.8-to-1.16.txt";
     private static final String ASSET_MODERN_1_17_PLUS = "minecraft_defaults/options-modern-1.17-plus.txt";
+
+    private static final String INSTANCE_METADATA_DIR = "metadata";
+    private static final String INSTANCE_JSON = "instance.json";
+    private static final String FALLBACK_MARKER_DIR = ".droidbridge";
+    private static final String MARKER_FILE = "default-options.seeded";
 
     private static final Pattern NUMBER_PATTERN = Pattern.compile("(\\d+)");
 
@@ -64,31 +83,67 @@ public final class DefaultMinecraftOptionsInstaller {
     }
 
     /**
-     * Call this when creating a new instance, using the selected Minecraft version id/name.
-     * Examples: "b1.7.3", "1.12.2", "1.21.11", "26.1.2", "26.2-snapshot-2".
+     * Safe default entry point.
+     *
+     * It only seeds once, only if options.txt is missing, and only if the game directory still
+     * looks like a clean launcher-created folder.
      */
     public static void installIfMissingForNewInstance(
             @NonNull Context context,
             @NonNull File gameDirectory,
             @Nullable String minecraftVersionId
     ) {
+        tryInstallIfMissingForNewInstance(context, gameDirectory, minecraftVersionId, false);
+    }
+
+    /**
+     * Advanced entry point.
+     *
+     * allowInNonEmptyGameDirectory should stay false for modpacks, imports, restores, copies,
+     * and launch-time calls. Only use true for an explicit "reset/add default options" user action.
+     *
+     * @return true when this method actually wrote DroidBridge's default options.txt.
+     */
+    public static boolean tryInstallIfMissingForNewInstance(
+            @NonNull Context context,
+            @NonNull File gameDirectory,
+            @Nullable String minecraftVersionId,
+            boolean allowInNonEmptyGameDirectory
+    ) {
         File optionsFile = new File(gameDirectory, "options.txt");
+        File markerFile = resolveMarkerFile(gameDirectory);
+
         if (optionsFile.exists()) {
+            writeMarkerIfMissing(markerFile, "existing-options", minecraftVersionId);
             Logging.i(TAG, "options.txt already exists, not overwriting: " + optionsFile.getAbsolutePath());
-            return;
+            return false;
+        }
+
+        if (markerFile.isFile()) {
+            Logging.i(TAG, "Default options decision already recorded, not creating options.txt again: "
+                    + markerFile.getAbsolutePath());
+            return false;
+        }
+
+        if (!allowInNonEmptyGameDirectory && hasMeaningfulGameContent(gameDirectory)) {
+            writeMarkerIfMissing(markerFile, "non-empty-game-directory", minecraftVersionId);
+            Logging.i(TAG, "Game directory is not empty, not creating default options.txt: "
+                    + gameDirectory.getAbsolutePath());
+            return false;
         }
 
         OptionsPreset preset = choosePreset(minecraftVersionId);
         if (preset == OptionsPreset.SKIP_UNKNOWN) {
+            writeMarkerIfMissing(markerFile, "unknown-version", minecraftVersionId);
             Logging.i(TAG, "Skipping default options.txt for unknown Minecraft version: "
                     + String.valueOf(minecraftVersionId));
-            return;
+            return false;
         }
 
         File parent = optionsFile.getParentFile();
         if (parent != null && !parent.exists() && !parent.mkdirs()) {
             Logging.i(TAG, "Unable to create game directory for default options: " + parent.getAbsolutePath());
-            return;
+            return false;
         }
 
         try (InputStream input = context.getAssets().open(preset.assetPath);
@@ -101,11 +156,15 @@ public final class DefaultMinecraftOptionsInstaller {
             }
             output.flush();
 
+            writeMarker(markerFile, "seeded-" + preset.logName, minecraftVersionId);
+
             Logging.i(TAG, "Seeded " + preset.logName + " options.txt for "
                     + String.valueOf(minecraftVersionId) + ": " + optionsFile.getAbsolutePath());
+            return true;
         } catch (Throwable throwable) {
             Logging.e(TAG, "Failed to seed default options.txt from asset "
                     + preset.assetPath + " to " + optionsFile.getAbsolutePath(), throwable);
+            return false;
         }
     }
 
@@ -181,6 +240,100 @@ public final class DefaultMinecraftOptionsInstaller {
             index++;
         }
         return result;
+    }
+
+    @NonNull
+    private static File resolveMarkerFile(@NonNull File gameDirectory) {
+        File parent = gameDirectory.getParentFile();
+        if (parent != null && "game".equalsIgnoreCase(gameDirectory.getName())) {
+            File instanceMetadata = new File(parent, INSTANCE_METADATA_DIR);
+            if (instanceMetadata.isDirectory() || new File(parent, INSTANCE_JSON).isFile()) {
+                return new File(instanceMetadata, MARKER_FILE);
+            }
+        }
+
+        return new File(new File(gameDirectory, FALLBACK_MARKER_DIR), MARKER_FILE);
+    }
+
+    private static boolean hasMeaningfulGameContent(@NonNull File gameDirectory) {
+        File[] children = gameDirectory.listFiles();
+        if (children == null || children.length == 0) return false;
+
+        for (File child : children) {
+            if (child == null) continue;
+
+            String name = child.getName();
+            if ("options.txt".equalsIgnoreCase(name)) continue;
+            if (FALLBACK_MARKER_DIR.equalsIgnoreCase(name)) continue;
+
+            if (child.isDirectory() && isLauncherCreatedEmptyFolder(name) && isDirectoryEffectivelyEmpty(child)) {
+                continue;
+            }
+
+            return true;
+        }
+
+        return false;
+    }
+
+    private static boolean isLauncherCreatedEmptyFolder(@NonNull String name) {
+        return "saves".equalsIgnoreCase(name)
+                || "resourcepacks".equalsIgnoreCase(name)
+                || "shaderpacks".equalsIgnoreCase(name)
+                || "mods".equalsIgnoreCase(name)
+                || "config".equalsIgnoreCase(name)
+                || "logs".equalsIgnoreCase(name);
+    }
+
+    private static boolean isDirectoryEffectivelyEmpty(@NonNull File directory) {
+        File[] children = directory.listFiles();
+        if (children == null || children.length == 0) return true;
+
+        for (File child : children) {
+            if (child == null) continue;
+            if (child.isDirectory()) {
+                if (!isDirectoryEffectivelyEmpty(child)) return false;
+            } else {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static void writeMarkerIfMissing(
+            @NonNull File markerFile,
+            @NonNull String reason,
+            @Nullable String minecraftVersionId
+    ) {
+        if (markerFile.isFile()) return;
+        writeMarker(markerFile, reason, minecraftVersionId);
+    }
+
+    private static void writeMarker(
+            @NonNull File markerFile,
+            @NonNull String reason,
+            @Nullable String minecraftVersionId
+    ) {
+        try {
+            File parent = markerFile.getParentFile();
+            if (parent != null && !parent.exists() && !parent.mkdirs()) {
+                Logging.i(TAG, "Unable to create default-options marker directory: " + parent.getAbsolutePath());
+                return;
+            }
+
+            String createdAt = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSZ", Locale.US).format(new Date());
+            String text = "reason=" + reason + "\n"
+                    + "minecraftVersionId=" + String.valueOf(minecraftVersionId) + "\n"
+                    + "createdAt=" + createdAt + "\n";
+
+            try (FileOutputStream output = new FileOutputStream(markerFile, false)) {
+                output.write(text.getBytes(StandardCharsets.UTF_8));
+                output.flush();
+            }
+        } catch (Throwable throwable) {
+            Logging.e(TAG, "Unable to write default-options marker: " + markerFile.getAbsolutePath(), throwable);
+        }
     }
 
     private enum OptionsPreset {

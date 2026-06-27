@@ -13,7 +13,9 @@
 package ca.dnamobile.javalauncher.controls;
 
 import android.content.Context;
+import android.database.Cursor;
 import android.net.Uri;
+import android.provider.OpenableColumns;
 
 import androidx.annotation.NonNull;
 
@@ -135,9 +137,25 @@ public final class TouchControlsStore {
 
     @NonNull
     public static File saveImportedLayout(@NonNull Context context, @NonNull Uri uri) throws Exception {
+        return saveImportedLayout(context, uri, TouchControlsLayoutData.IMPORT_MODE_DROIDBRIDGE);
+    }
+
+    @NonNull
+    public static File saveImportedLayout(@NonNull Context context, @NonNull Uri uri, int importMode) throws Exception {
         String source = readUriText(context, uri);
-        TouchControlsLayoutData data = TouchControlsLayoutData.fromJson(new JSONObject(source));
-        String cleanName = sanitizeFileName(data.name);
+        TouchControlsLayoutData data = TouchControlsLayoutData.fromJson(new JSONObject(source), importMode);
+
+        // The visible layout name should match the JSON file the user picked.
+        // This makes imported Zalith/Mojo/Amethyst profiles easier to identify than
+        // every file showing the generic internal layout name from the JSON body.
+        String importedDisplayName = displayNameForUri(context, uri);
+        String importedBaseName = baseNameWithoutJson(importedDisplayName);
+        if (importedBaseName.trim().isEmpty()) importedBaseName = baseNameWithoutJson(data.name);
+        if (importedBaseName.trim().isEmpty()) importedBaseName = "imported_controls";
+        data.name = importedBaseName.trim();
+        data.importedFileName = normalizeJsonFileName(importedDisplayName.trim().isEmpty() ? importedBaseName : importedDisplayName);
+
+        String cleanName = sanitizeFileName(importedBaseName);
         if (cleanName.isEmpty()) cleanName = "imported_controls";
         File target = uniqueFile(getControlsDir(context), cleanName, ".json");
         saveLayout(target, data);
@@ -190,6 +208,42 @@ public final class TouchControlsStore {
         }
 
         throw new IllegalStateException("No bundled default touch layout found. Expected " + DEFAULT_ASSET, lastError);
+    }
+
+    @NonNull
+    private static String displayNameForUri(@NonNull Context context, @NonNull Uri uri) {
+        try (Cursor cursor = context.getContentResolver().query(uri, new String[]{OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+            if (cursor != null && cursor.moveToFirst()) {
+                int index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+                if (index >= 0) {
+                    String name = cursor.getString(index);
+                    if (name != null && !name.trim().isEmpty()) return name.trim();
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+
+        String last = uri.getLastPathSegment();
+        return last == null ? "" : last.trim();
+    }
+
+    @NonNull
+    private static String normalizeJsonFileName(@NonNull String name) {
+        String clean = name.trim();
+        int slash = Math.max(clean.lastIndexOf('/'), clean.lastIndexOf('\\'));
+        if (slash >= 0 && slash + 1 < clean.length()) clean = clean.substring(slash + 1);
+        if (clean.trim().isEmpty()) clean = "imported_controls";
+        if (!clean.toLowerCase().endsWith(".json")) clean += ".json";
+        return clean.trim();
+    }
+
+    @NonNull
+    private static String baseNameWithoutJson(@NonNull String name) {
+        String clean = name.trim();
+        int slash = Math.max(clean.lastIndexOf('/'), clean.lastIndexOf('\\'));
+        if (slash >= 0 && slash + 1 < clean.length()) clean = clean.substring(slash + 1);
+        if (clean.toLowerCase().endsWith(".json")) clean = clean.substring(0, clean.length() - 5);
+        return clean.trim();
     }
 
     @NonNull

@@ -39,6 +39,7 @@ public final class FloatingGameSettingsOverlayController {
     private static final int DEFAULT_MARGIN_DP = 16;
     private static final int WRAPPER_SIZE_DP = 58;
     private static final int BUTTON_SIZE_DP = 48;
+    private static final int LARGE_FPS_BUTTON_OVERLAP_DP = BUTTON_SIZE_DP / 4;
 
     @NonNull private final Activity activity;
     @NonNull private final ImageButton settingsButton;
@@ -75,7 +76,7 @@ public final class FloatingGameSettingsOverlayController {
         if (attached) return;
         attached = true;
         ensureWrapped();
-        settingsButton.setOnTouchListener(this::onSettingsButtonTouch);
+        settingsButton.setOnTouchListener(this::onFloatingOverlayTouch);
         refreshFromPreferences(true);
     }
 
@@ -92,6 +93,9 @@ public final class FloatingGameSettingsOverlayController {
     public void detach() {
         pause();
         settingsButton.setOnTouchListener(null);
+        if (fpsText != null) {
+            fpsText.setOnTouchListener(null);
+        }
         attached = false;
     }
 
@@ -112,15 +116,18 @@ public final class FloatingGameSettingsOverlayController {
         if (wrapper == null) return;
 
         boolean showButton = LauncherPreferences.isShowInGameSettingsButton(activity);
-        wrapper.setVisibility(showButton ? View.VISIBLE : View.GONE);
+        boolean showFps = GameOverlayPreferences.isShowGameFpsCounter(activity);
+        boolean showAnything = showButton || showFps;
+
+        wrapper.setVisibility(showAnything ? View.VISIBLE : View.GONE);
         settingsButton.setVisibility(showButton ? View.VISIBLE : View.GONE);
 
-        if (applyPosition && showButton) {
+        if (applyPosition && showAnything) {
             wrapper.post(this::applySavedPosition);
         }
 
-        updateFpsText(showButton);
-        if (showButton) bringToFront();
+        updateFpsText(showButton, showFps);
+        if (showAnything) bringToFront();
     }
 
     @Nullable
@@ -193,7 +200,13 @@ public final class FloatingGameSettingsOverlayController {
     @NonNull
     private TextView findOrCreateFpsText(@NonNull FrameLayout wrapper) {
         View existing = wrapper.findViewWithTag("game_settings_fps_badge");
-        if (existing instanceof TextView) return (TextView) existing;
+        if (existing instanceof TextView) {
+            TextView text = (TextView) existing;
+            text.setClickable(true);
+            text.setFocusable(false);
+            text.setOnTouchListener(this::onFloatingOverlayTouch);
+            return text;
+        }
 
         TextView text = new TextView(activity);
         text.setTag("game_settings_fps_badge");
@@ -207,8 +220,9 @@ public final class FloatingGameSettingsOverlayController {
         text.setTextSize(8f);
         text.setTypeface(Typeface.DEFAULT_BOLD);
         text.setVisibility(View.GONE);
-        text.setClickable(false);
+        text.setClickable(true);
         text.setFocusable(false);
+        text.setOnTouchListener(this::onFloatingOverlayTouch);
 
         FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -219,15 +233,17 @@ public final class FloatingGameSettingsOverlayController {
         return text;
     }
 
-    private void updateFpsText(boolean showButton) {
+    private void updateFpsText(boolean showButton, boolean showFps) {
         TextView text = fpsText;
         if (text == null) return;
 
-        boolean showFps = showButton && GameOverlayPreferences.isShowGameFpsCounter(activity);
         if (!showFps) {
             text.setVisibility(View.GONE);
+            resetButtonOnlyLayout(showButton);
             return;
         }
+
+        applyFpsCounterSize(text, showButton);
 
         int fps;
         try {
@@ -240,7 +256,99 @@ public final class FloatingGameSettingsOverlayController {
         text.setVisibility(View.VISIBLE);
     }
 
-    private boolean onSettingsButtonTouch(View view, MotionEvent event) {
+    private void applyFpsCounterSize(@NonNull TextView text, boolean showButton) {
+        String size = GameOverlayPreferences.getGameFpsCounterSize(activity);
+        boolean large = GameOverlayPreferences.FPS_SIZE_LARGE.equals(size);
+        int minWidthDp;
+        int horizontalPaddingDp;
+        int verticalPaddingDp;
+        float textSizeSp;
+
+        if (large) {
+            minWidthDp = 0;
+            horizontalPaddingDp = 10;
+            verticalPaddingDp = 4;
+            textSizeSp = 16f;
+        } else if (GameOverlayPreferences.FPS_SIZE_MEDIUM.equals(size)) {
+            minWidthDp = 58;
+            horizontalPaddingDp = 8;
+            verticalPaddingDp = 3;
+            textSizeSp = 12f;
+        } else {
+            minWidthDp = 42;
+            horizontalPaddingDp = 5;
+            verticalPaddingDp = 2;
+            textSizeSp = 8f;
+        }
+
+        text.setSingleLine(true);
+        text.setMinWidth(dpToPx(minWidthDp));
+        text.setMinimumWidth(dpToPx(minWidthDp));
+        text.setPadding(
+                dpToPx(horizontalPaddingDp),
+                dpToPx(verticalPaddingDp),
+                dpToPx(horizontalPaddingDp),
+                dpToPx(verticalPaddingDp)
+        );
+        text.setTextSize(textSizeSp);
+
+        ViewGroup.LayoutParams params = text.getLayoutParams();
+        if (params instanceof FrameLayout.LayoutParams) {
+            FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) params;
+            lp.width = ViewGroup.LayoutParams.WRAP_CONTENT;
+            lp.height = ViewGroup.LayoutParams.WRAP_CONTENT;
+            lp.topMargin = large && showButton ? dpToPx(BUTTON_SIZE_DP - LARGE_FPS_BUTTON_OVERLAP_DP) : 0;
+            lp.gravity = showButton
+                    ? Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL
+                    : Gravity.CENTER;
+            text.setLayoutParams(lp);
+        }
+
+        applyOverlayChildLayout(showButton, true, large);
+    }
+
+    private void resetButtonOnlyLayout(boolean showButton) {
+        applyOverlayChildLayout(showButton, false, false);
+    }
+
+    private void applyOverlayChildLayout(boolean showButton, boolean showFps, boolean largeFps) {
+        FrameLayout wrapper = floatingContainer;
+        if (wrapper == null) return;
+
+        ViewGroup.LayoutParams wrapperParams = wrapper.getLayoutParams();
+        if (wrapperParams != null) {
+            boolean wrapContainer = showFps && (!showButton || largeFps);
+            wrapperParams.width = wrapContainer
+                    ? ViewGroup.LayoutParams.WRAP_CONTENT
+                    : Math.max(dpToPx(WRAPPER_SIZE_DP), wrapperParams.width > 0 ? wrapperParams.width : dpToPx(WRAPPER_SIZE_DP));
+            wrapperParams.height = wrapContainer
+                    ? ViewGroup.LayoutParams.WRAP_CONTENT
+                    : Math.max(dpToPx(WRAPPER_SIZE_DP), wrapperParams.height > 0 ? wrapperParams.height : dpToPx(WRAPPER_SIZE_DP));
+            wrapper.setLayoutParams(wrapperParams);
+        }
+
+        ViewGroup.LayoutParams buttonParams = settingsButton.getLayoutParams();
+        if (buttonParams instanceof FrameLayout.LayoutParams) {
+            FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) buttonParams;
+            lp.width = dpToPx(BUTTON_SIZE_DP);
+            lp.height = dpToPx(BUTTON_SIZE_DP);
+            lp.gravity = showFps && largeFps && showButton
+                    ? Gravity.TOP | Gravity.CENTER_HORIZONTAL
+                    : Gravity.CENTER;
+            lp.leftMargin = 0;
+            lp.topMargin = 0;
+            lp.rightMargin = 0;
+            lp.bottomMargin = 0;
+            settingsButton.setLayoutParams(lp);
+            if (showFps && largeFps && showButton && fpsText != null) {
+                fpsText.bringToFront();
+            }
+        }
+
+        wrapper.requestLayout();
+    }
+
+    private boolean onFloatingOverlayTouch(View view, MotionEvent event) {
         FrameLayout wrapper = ensureWrapped();
         if (wrapper == null) return false;
 
@@ -276,7 +384,7 @@ public final class FloatingGameSettingsOverlayController {
                 if (dragging) {
                     saveCurrentPosition();
                     dragging = false;
-                } else if (event.getActionMasked() == MotionEvent.ACTION_UP) {
+                } else if (event.getActionMasked() == MotionEvent.ACTION_UP && view == settingsButton) {
                     view.performClick();
                 }
                 return true;

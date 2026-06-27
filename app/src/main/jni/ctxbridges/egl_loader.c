@@ -15,11 +15,6 @@
  *
  * SPDX-License-Identifier: LGPL-3.0-only
  */
-
-//
-// Created by maks on 21.09.2022.
-// DroidBridge: Mesa/KGSL loader hardening for Android EGL platform display.
-//
 #include <stddef.h>
 #include <stdlib.h>
 #include <dlfcn.h>
@@ -31,6 +26,7 @@
 #include "br_loader.h"
 #include "egl_loader.h"
 #include "../driver_helper/nsbypass.h"
+#include "../droidbridge_renderspec.h"
 
 static const char* EGL_LOADER_TAG = "DroidBridgeEGLLoader";
 static void* g_egl_handle = NULL;
@@ -105,10 +101,6 @@ static void* try_namespace_egl_once(const char* namespace_path, const char* shor
         loader_log("Mesa namespace load failed path=%s library=%s", namespace_path, short_name);
         return NULL;
     }
-
-    /* Mojo's working KGSL path loads libEGL_mesa.so in an Android linker namespace.
-     * Keep this local to the namespace; EGL symbols are resolved from the returned handle.
-     */
     dlerror();
     void* handle = linker_ns_dlopen(short_name, flags | RTLD_GLOBAL);
     if (handle != NULL) {
@@ -120,12 +112,6 @@ static void* try_namespace_egl_once(const char* namespace_path, const char* shor
     const char* error = dlerror();
     loader_log("Mesa namespace EGL short-name load failed library=%s path=%s error=%s",
                short_name, namespace_path, error ? error : "unknown");
-
-    /* Some Android 13 linker configurations create the namespace but do not use
-     * the custom ld_library_path for short-name lookup. If that happens, retry
-     * the absolute APK native path inside the same namespace. This still keeps
-     * Mesa in the namespace, unlike the old plain dlopen fallback.
-     */
     const char* absolute = getenv("DROIDBRIDGE_MESA_EGL");
     if (absolute != NULL && absolute[0] != '\0') {
         dlerror();
@@ -148,12 +134,6 @@ static void* try_namespace_egl(const char* library_name, int flags) {
 
     const char* short_name = file_name_only(library_name);
     if (short_name == NULL || short_name[0] == '\0') short_name = "libEGL_mesa.so";
-
-    /* Mojo passes POJAV_NATIVEDIR as a single app-native lib directory. Passing a
-     * colon-separated LD path here can make android_create_namespace fail before
-     * libEGL_mesa.so is even tried. Use the single native directory first; Mesa
-     * still finds DRI driver aliases through LIBGL_DRIVERS_PATH/DRIVER_PATH.
-     */
     void* handle = try_namespace_egl_once(getenv("DROIDBRIDGE_MESA_NATIVE_DIR"), short_name, flags);
     if (handle != NULL) return handle;
 
@@ -176,6 +156,27 @@ const char* droidbridge_egl_get_loaded_name(void) {
     return g_egl_loaded_name[0] != '\0' ? g_egl_loaded_name : "<none>";
 }
 
+
+void dlsym_EGL();
+
+static void* droidbridge_egl_acquire_existing_for_renderspec(const char* ignored_name) {
+    (void) ignored_name;
+    if (g_egl_handle != NULL) {
+        return g_egl_handle;
+    }
+    dlsym_EGL();
+    return g_egl_handle;
+}
+
+static bool droidbridge_should_native_configure_renderspec(void) {
+    const char* renderer = getenv("POJAV_RENDERER");
+    const char* mesa = getenv("DROIDBRIDGE_MESA");
+    const char* mode = getenv("DROIDBRIDGE_MESA_MODE");
+    if (renderer != NULL && strcmp(renderer, "freedreno_kgsl") == 0) return true;
+    if (mesa != NULL && mesa[0] != '\0' && mode != NULL && mode[0] != '\0') return true;
+    return false;
+}
+
 void dlsym_EGL() {
     if (g_egl_handle != NULL) return;
 
@@ -189,14 +190,17 @@ void dlsym_EGL() {
         eglName = getenv("POJAVEXEC_EGL");
     }
 
+    const char* renderer = getenv("POJAV_RENDERER");
+    const bool directKgsl = renderer != NULL && strcmp(renderer, "freedreno_kgsl") == 0;
+    if (directKgsl) {
+        eglName = "libEGL_mesa.so";
+        setenv("POJAVEXEC_EGL", "libEGL_mesa.so", 1);
+        setenv("LIB_MESA_NAME", "libEGL_mesa.so", 1);
+    }
+
     int flags = RTLD_NOW | (mesa ? RTLD_GLOBAL : RTLD_LOCAL);
 
     if (mesa) {
-        /* Prefer Mojo-style Android linker namespace loading first. On KGSL,
-         * loading libEGL_mesa.so in the normal app namespace can resolve symbols
-         * but still fail eglInitialize(EGL_NOT_INITIALIZED). Mojo's working log
-         * shows: Loaded EGL libEGL_mesa.so (in namespace: 1).
-         */
         g_egl_handle = try_namespace_egl(getenv("POJAVEXEC_EGL"), flags);
         if (g_egl_handle == NULL) {
             g_egl_handle = try_namespace_egl(getenv("DROIDBRIDGE_MESA_EGL"), flags);
@@ -247,4 +251,15 @@ void dlsym_EGL() {
 
     loader_log("EGL symbols loaded from %s getPlatformDisplay=%p queryString=%p",
                droidbridge_egl_get_loaded_name(), eglGetPlatformDisplay_p, eglQueryString_p);
+
+    if (droidbridge_should_native_configure_renderspec()) {
+        droidbridge_renderspec_configure_native(
+                "libEGL_mesa.so",
+                droidbridge_egl_acquire_existing_for_renderspec,
+                0,
+                0);
+        loader_log("v74 configured native RenderSpec from already-loaded EGL handle=%p loaded=%s",
+                   g_egl_handle,
+                   droidbridge_egl_get_loaded_name());
+    }
 }

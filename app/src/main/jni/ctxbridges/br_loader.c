@@ -30,11 +30,17 @@ __eglMustCastToProperFunctionPointerType (*eglGetProcAddress_p) (const char *pro
 void* (*OSMesaGetProcAddress_p)(const char* funcName);
 
 void* load_symbol(void* handle, const char* symbol_name) {
+    dlerror();
     void* symbol = dlsym(handle, symbol_name);
     if (!symbol)
         fprintf(stderr, "Error[Load Symbol]: Failed to load symbol '%s': %s\n", symbol_name, dlerror());
 
     return symbol;
+}
+
+void* load_symbol_optional(void* handle, const char* symbol_name) {
+    dlerror();
+    return dlsym(handle, symbol_name);
 }
 
 void* OSMGetProcAddress(void* handle, const char* symbol_name) {
@@ -49,6 +55,19 @@ void* OSMGetProcAddress(void* handle, const char* symbol_name) {
         fprintf(stderr, "Error[OSM Loader]: 'OSMesaGetProcAddress' could not find symbol '%s'.\n", symbol_name);
     }
     return load_symbol(handle, symbol_name);
+}
+
+void* OSMGetProcAddressOptional(void* handle, const char* symbol_name) {
+    OSMesaGetProcAddress_p = load_symbol_optional(handle, "OSMesaGetProcAddress");
+    if (OSMesaGetProcAddress_p)
+    {
+        void* symbol = OSMesaGetProcAddress_p(symbol_name);
+        if (symbol)
+        {
+            return symbol;
+        }
+    }
+    return load_symbol_optional(handle, symbol_name);
 }
 
 void* GLGetProcAddress(void* handle, const char* symbol_name) {

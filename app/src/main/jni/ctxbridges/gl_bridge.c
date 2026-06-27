@@ -31,10 +31,6 @@
 #include "gl_bridge.h"
 #include "egl_loader.h"
 
-//
-// Created by maks on 17.09.2022.
-//
-
 static const char* g_LogTag = "GLBridge";
 
 #ifndef EGL_PLATFORM_ANDROID_KHR
@@ -108,13 +104,20 @@ static bool env_is(const char* name, const char* expected) {
     return value != NULL && expected != NULL && strcmp(value, expected) == 0;
 }
 
+static bool should_force_opaque_rgbx8888_visual(void) {
+    return env_enabled("DROIDBRIDGE_EGL_FORCE_RGBX8888")
+           || env_enabled("DROIDBRIDGE_DIRECT_FREEDRENO_OPAQUE_RGBX8888");
+}
+
+static bool should_force_rgba8888_visual(void) {
+
+    if (should_force_opaque_rgbx8888_visual()) {
+        return false;
+    }
+    return env_enabled("DROIDBRIDGE_EGL_FORCE_RGBA8888");
+}
+
 static bool should_force_desktop_gl(void) {
-    /*
-     * DroidBridge Mesa Zink/Turnip intentionally enters libpojavexec through
-     * POJAV_RENDERER=opengles3 to avoid the legacy OSMesa renderer path.
-     * That must not create an OpenGL ES context: Minecraft 26.x compiles
-     * desktop GLSL 330+ shaders and needs desktop OpenGL from Zink.
-     */
     return env_enabled("DROIDBRIDGE_EGL_FORCE_DESKTOP_GL")
            || env_enabled("DROIDBRIDGE_MESA_DESKTOP_GL")
            || (env_enabled("DROIDBRIDGE_MESA")
@@ -126,6 +129,9 @@ static __thread gl_render_window_t* currentBundle;
 static EGLDisplay g_EglDisplay = EGL_NO_DISPLAY;
 
 static bool should_use_safe_android_swaps(void) {
+    if (env_enabled("DROIDBRIDGE_EGL_NO_FORCED_DESTROYED_SWAP")) {
+        return false;
+    }
     return should_force_desktop_gl() || env_enabled("DROIDBRIDGE_MESA_SAFE_SWAPS");
 }
 
@@ -264,20 +270,24 @@ gl_render_window_t* gl_init_context(gl_render_window_t *share) {
     memset(bundle, 0, sizeof(gl_render_window_t));
 
     const bool desktop_gl = should_force_desktop_gl();
+    const bool force_opaque_rgbx8888 = should_force_opaque_rgbx8888_visual();
+    const bool force_rgba8888 = should_force_rgba8888_visual();
     const EGLint requested_renderable_type = desktop_gl ? EGL_OPENGL_BIT : EGL_OPENGL_ES2_BIT;
+    const EGLint desired_alpha_size = force_rgba8888 ? 8 : (force_opaque_rgbx8888 ? 0 : (desktop_gl ? 0 : 8));
 
-    /*
-     * Mesa/Zink desktop GL must use an opaque RGBX Android window surface when
-     * possible. An RGBA window surface lets Minecraft's fragment alpha leak into
-     * Android composition and causes black/transparent sky/cloud/chunk artifacts.
-     * Prefer: RGBX + depth + stencil + desktop GL.
-     * Fallbacks are kept only so broken Mesa builds still fail gracefully.
-     */
+    if (force_opaque_rgbx8888) {
+        gl_log(ANDROID_LOG_INFO,
+               "v69 explicit direct Freedreno RGBX visual debug path: requesting opaque RGBX_8888 alpha=0");
+    } else if (force_rgba8888) {
+        gl_log(ANDROID_LOG_WARN,
+               "v69 explicit RGBA_8888 visual requested: alpha=8");
+    }
+
     const EGLint egl_attributes_strict[] = {
             EGL_BLUE_SIZE, 8,
             EGL_GREEN_SIZE, 8,
             EGL_RED_SIZE, 8,
-            EGL_ALPHA_SIZE, desktop_gl ? 0 : 8,
+            EGL_ALPHA_SIZE, desired_alpha_size,
             EGL_DEPTH_SIZE, 24,
             EGL_STENCIL_SIZE, desktop_gl ? 8 : 0,
             EGL_SURFACE_TYPE, EGL_WINDOW_BIT | EGL_PBUFFER_BIT,
@@ -288,7 +298,7 @@ gl_render_window_t* gl_init_context(gl_render_window_t *share) {
             EGL_BLUE_SIZE, 8,
             EGL_GREEN_SIZE, 8,
             EGL_RED_SIZE, 8,
-            EGL_ALPHA_SIZE, desktop_gl ? 0 : 8,
+            EGL_ALPHA_SIZE, desired_alpha_size,
             EGL_DEPTH_SIZE, 24,
             EGL_STENCIL_SIZE, desktop_gl ? 8 : 0,
             EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
@@ -299,7 +309,7 @@ gl_render_window_t* gl_init_context(gl_render_window_t *share) {
             EGL_BLUE_SIZE, 8,
             EGL_GREEN_SIZE, 8,
             EGL_RED_SIZE, 8,
-            EGL_ALPHA_SIZE, desktop_gl ? 0 : 8,
+            EGL_ALPHA_SIZE, desired_alpha_size,
             EGL_DEPTH_SIZE, 24,
             EGL_SURFACE_TYPE, EGL_WINDOW_BIT | EGL_PBUFFER_BIT,
             EGL_RENDERABLE_TYPE, requested_renderable_type,
@@ -309,7 +319,7 @@ gl_render_window_t* gl_init_context(gl_render_window_t *share) {
             EGL_BLUE_SIZE, 8,
             EGL_GREEN_SIZE, 8,
             EGL_RED_SIZE, 8,
-            EGL_ALPHA_SIZE, desktop_gl ? 0 : 8,
+            EGL_ALPHA_SIZE, desired_alpha_size,
             EGL_DEPTH_SIZE, 24,
             EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
             EGL_RENDERABLE_TYPE, requested_renderable_type,
@@ -319,7 +329,7 @@ gl_render_window_t* gl_init_context(gl_render_window_t *share) {
             EGL_BLUE_SIZE, 8,
             EGL_GREEN_SIZE, 8,
             EGL_RED_SIZE, 8,
-            EGL_ALPHA_SIZE, desktop_gl ? 0 : 8,
+            EGL_ALPHA_SIZE, desired_alpha_size,
             EGL_DEPTH_SIZE, 24,
             EGL_STENCIL_SIZE, desktop_gl ? 8 : 0,
             EGL_SURFACE_TYPE, EGL_WINDOW_BIT | EGL_PBUFFER_BIT,
@@ -329,7 +339,7 @@ gl_render_window_t* gl_init_context(gl_render_window_t *share) {
             EGL_BLUE_SIZE, 8,
             EGL_GREEN_SIZE, 8,
             EGL_RED_SIZE, 8,
-            EGL_ALPHA_SIZE, desktop_gl ? 0 : 8,
+            EGL_ALPHA_SIZE, desired_alpha_size,
             EGL_DEPTH_SIZE, 24,
             EGL_STENCIL_SIZE, desktop_gl ? 8 : 0,
             EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
@@ -339,7 +349,7 @@ gl_render_window_t* gl_init_context(gl_render_window_t *share) {
             EGL_BLUE_SIZE, 8,
             EGL_GREEN_SIZE, 8,
             EGL_RED_SIZE, 8,
-            EGL_ALPHA_SIZE, desktop_gl ? 0 : 8,
+            EGL_ALPHA_SIZE, desired_alpha_size,
             EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
             EGL_NONE
     };
@@ -483,11 +493,21 @@ gl_render_window_t* gl_init_context(gl_render_window_t *share) {
                "desktop GL config advertises EGL_SWAP_BEHAVIOR_PRESERVED_BIT; forcing destroyed swap behavior on created surfaces");
     }
 
-    if (desktop_gl && actual_alpha_size > 0) {
+    if (desktop_gl && actual_alpha_size > 0 && !force_rgba8888) {
         gl_log(ANDROID_LOG_WARN,
                "desktop GL selected an alpha window config alpha=%d nativeVisual=0x%x; this can cause black sky/cloud/chunk alpha artifacts on Android",
                actual_alpha_size,
                bundle->format);
+    }
+
+    if (force_opaque_rgbx8888) {
+        gl_log(ANDROID_LOG_INFO,
+               "v69 opaque RGBX visual selected nativeVisual=0x%x alpha=%d mode=%s",
+               bundle->format, actual_alpha_size, chosen_attributes_name);
+    } else if (force_rgba8888) {
+        gl_log(ANDROID_LOG_INFO,
+               "Freedreno/Adreno visual workaround selected nativeVisual=0x%x alpha=%d mode=%s",
+               bundle->format, actual_alpha_size, chosen_attributes_name);
     }
 
     if (desktop_gl && (actual_renderable_type & EGL_OPENGL_BIT) == 0) {
@@ -606,7 +626,12 @@ void gl_swap_surface(gl_render_window_t* bundle) {
         bundle->nativeSurface = bundle->newNativeSurface;
         bundle->newNativeSurface = NULL;
         ANativeWindow_acquire(bundle->nativeSurface);
-        ANativeWindow_setBuffersGeometry(bundle->nativeSurface, 0, 0, bundle->format);
+        const int setGeometryResult = ANativeWindow_setBuffersGeometry(bundle->nativeSurface, 0, 0, bundle->format);
+        if (setGeometryResult != 0) {
+            gl_log(ANDROID_LOG_WARN, "v69 ANativeWindow_setBuffersGeometry format=0x%x failed result=%d", bundle->format, setGeometryResult);
+        } else if (should_force_opaque_rgbx8888_visual()) {
+            gl_log(ANDROID_LOG_INFO, "v69 ANativeWindow format forced opaque RGBX/nativeVisual=0x%x", bundle->format);
+        }
         const EGLint droidbridge_window_surface_attrs[] = {
                 EGL_RENDER_BUFFER, EGL_BACK_BUFFER,
                 EGL_NONE
@@ -661,6 +686,16 @@ void gl_make_current(gl_render_window_t* bundle) {
     if (eglMakeCurrent_p(g_EglDisplay, bundle->surface, bundle->surface, bundle->context))
     {
         currentBundle = bundle;
+        const char* renderer = getenv("POJAV_RENDERER");
+        if (renderer != NULL && strcmp(renderer, "freedreno_kgsl") == 0) {
+            EGLContext current = eglGetCurrentContext_p != NULL ? eglGetCurrentContext_p() : EGL_NO_CONTEXT;
+            gl_log(ANDROID_LOG_INFO,
+                   "eglMakeCurrent success v69 context=%p current=%p surface=%p renderer=%s",
+                   bundle->context,
+                   current,
+                   bundle->surface,
+                   renderer);
+        }
     } else {
         if (hasSetMainWindow)
         {

@@ -47,6 +47,19 @@ public final class InstanceIconResolver {
                 + " " + normalize(minecraftVersionId)
                 + " " + normalize(instanceName);
 
+        // Better Than Adventure should use its own icon even though it inherits b1.7.3
+        // and may otherwise fall back to the old grass block icon.
+        if (isBetterThanAdventure(combined)) {
+            return R.drawable.bta_icon;
+        }
+
+        // OptiFine should use its own icon whenever no custom instance icon is set.
+        // Keep this before Forge/Fabric because OptiFine instances may also mention
+        // another loader in the version id or instance name.
+        if (isOptiFine(combined)) {
+            return R.drawable.ic_optifine;
+        }
+
         // Check NeoForge before Forge because "neoforge" contains "forge".
         if (combined.contains("neoforge") || combined.contains("neo forge")) {
             return R.drawable.ic_neoforge;
@@ -61,6 +74,28 @@ public final class InstanceIconResolver {
         }
 
         return R.drawable.ic_old_grass_block;
+    }
+
+    private static boolean isBetterThanAdventure(@NonNull String combined) {
+        return combined.contains("betterthanadventure")
+                || combined.contains("better than adventure")
+                || combined.contains("better-than-adventure")
+                || combined.contains("better_than_adventure")
+                || combined.startsWith("bta ")
+                || combined.contains(" bta ")
+                || combined.contains("bta-")
+                || combined.contains("bta_")
+                || combined.contains("bta(")
+                || combined.contains("bta (");
+    }
+
+    private static boolean isOptiFine(@NonNull String combined) {
+        return combined.contains("optifine")
+                || combined.contains("opti fine")
+                || combined.contains("optifine-")
+                || combined.contains("optifine_")
+                || combined.contains("preview_optifine")
+                || combined.contains("preview-optifine");
     }
 
     @NonNull

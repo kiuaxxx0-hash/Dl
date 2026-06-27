@@ -15,22 +15,28 @@ package ca.dnamobile.javalauncher.modcompat;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
+import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.File;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import ca.dnamobile.javalauncher.feature.log.Logging;
+import net.kdt.pojavlaunch.Logger;
 
 public final class VulkanModConfigMitigation {
     private static final String TAG = "VulkanModConfigMitigation";
 
-    private static final Pattern VERSION_PATTERN = Pattern.compile(
-            "VulkanMod.*?([0-9]+\\.[0-9]+\\.[0-9]+).*?\\.jar",
-            Pattern.CASE_INSENSITIVE
+    private static final Pattern VERSION_AFTER_DASH_PATTERN = Pattern.compile(
+            "(?i)vulkanmod(?:[_-][0-9]+\\.[0-9]+(?:\\.[0-9]+)?)?-([0-9]+\\.[0-9]+\\.[0-9]+).*?\\.jar$"
+    );
+    private static final Pattern ANY_VERSION_PATTERN = Pattern.compile(
+            "([0-9]+\\.[0-9]+\\.[0-9]+)"
     );
 
     private VulkanModConfigMitigation() {
@@ -42,30 +48,54 @@ public final class VulkanModConfigMitigation {
         try {
             File modJar = findVulkanModJar(gameDir);
             if (modJar == null) {
-                Logging.i(TAG, "No VulkanMod jar found.");
+                appendLog("VulkanMod config mitigation: no VulkanMod jar found.");
                 return;
             }
 
-            String version = extractVersion(modJar.getName());
+            String version = extractVulkanModVersion(modJar.getName());
             if (version == null || version.trim().isEmpty()) {
-                Logging.i(TAG, "VulkanMod found but version could not be parsed: " + modJar.getName());
+                appendLog("VulkanMod config mitigation: VulkanMod found but version could not be parsed: " + modJar.getName());
                 return;
             }
 
-            if (compareVersions(version, "0.6.3") < 0) {
-                Logging.i(TAG, "Skipped for VulkanMod " + version);
+            /*
+             * DroidBridge needs the same VulkanMod windowMode guard that worked in Zalith.
+             * Apply this to the old 1.21.10 VulkanMod line too. The previous code could
+             * accidentally pick vulkanMod-android-libs-0.2.0.jar first and then skip the real
+             * VulkanMod_1.21.10-0.6.0.jar.
+             */
+            if (compareVersions(version, "0.6.0") < 0) {
+                appendLog("VulkanMod config mitigation: skipped for VulkanMod " + version);
                 return;
             }
 
             File configDir = new File(gameDir, "config");
             if (!configDir.exists() && !configDir.mkdirs()) {
-                Logging.i(TAG, "Could not create config dir: " + configDir.getAbsolutePath());
+                appendLog("VulkanMod config mitigation: could not create config dir: " + configDir.getAbsolutePath());
                 return;
             }
 
             File configFile = new File(configDir, "vulkanmod_settings.json");
 
             JSONObject json = readJson(configFile);
+            sanitizeVulkanModJson(json);
+
+            Files.write(
+                    configFile.toPath(),
+                    json.toString(2).getBytes(StandardCharsets.UTF_8)
+            );
+
+            sanitizeMinecraftOptions(gameDir);
+
+            appendLog("VulkanMod config mitigation: forced Android-safe video state for VulkanMod " + version);
+        } catch (Throwable throwable) {
+            appendLog("VulkanMod config mitigation: failed: " + throwable);
+            Logging.e(TAG, "Failed to apply VulkanMod config mitigation", throwable);
+        }
+    }
+
+    private static void sanitizeVulkanModJson(@NonNull JSONObject json) {
+        try {
             JSONObject videoMode = json.optJSONObject("videoMode");
             if (videoMode == null) {
                 videoMode = new JSONObject();
@@ -77,18 +107,97 @@ public final class VulkanModConfigMitigation {
             videoMode.put("refreshRate", -1);
 
             json.put("videoMode", videoMode);
-
-            // 2 = fullscreen/window mode fix used to stop VulkanMod 0.6.3+ crashing
             json.put("windowMode", 2);
 
-            Files.write(
-                    configFile.toPath(),
-                    json.toString(2).getBytes(StandardCharsets.UTF_8)
-            );
-
-            Logging.i(TAG, "Forced windowMode=2 for VulkanMod " + version);
+            /*
+             * Some PC-created packs or compatibility mods can leave monitor selector state in the
+             * VulkanMod config. Android's GLFW bridge exposes a synthetic display, so desktop monitor
+             * names/ids are not portable. Remove monitor hints but keep normal rendering options.
+             */
+            removeDesktopMonitorKeys(json);
         } catch (Throwable throwable) {
-            Logging.e(TAG, "Failed to apply VulkanMod config mitigation", throwable);
+            appendLog("VulkanMod config mitigation: could not sanitize VulkanMod JSON: " + throwable);
+        }
+    }
+
+    private static boolean removeDesktopMonitorKeys(@Nullable Object value) {
+        boolean changed = false;
+
+        if (value instanceof JSONObject) {
+            JSONObject object = (JSONObject) value;
+            JSONArray names = object.names();
+            if (names == null) return false;
+
+            for (int i = names.length() - 1; i >= 0; i--) {
+                String key = names.optString(i, null);
+                if (key == null) continue;
+
+                if (isDesktopMonitorKey(key)) {
+                    object.remove(key);
+                    changed = true;
+                } else if (removeDesktopMonitorKeys(object.opt(key))) {
+                    changed = true;
+                }
+            }
+        } else if (value instanceof JSONArray) {
+            JSONArray array = (JSONArray) value;
+            for (int i = 0; i < array.length(); i++) {
+                if (removeDesktopMonitorKeys(array.opt(i))) changed = true;
+            }
+        }
+
+        return changed;
+    }
+
+    private static boolean isDesktopMonitorKey(@NonNull String key) {
+        String lower = key.toLowerCase(java.util.Locale.ROOT);
+        return lower.contains("monitor")
+                || lower.contains("display") && lower.contains("name")
+                || lower.contains("fullscreen") && lower.contains("resolution");
+    }
+
+    private static void sanitizeMinecraftOptions(@NonNull File gameDir) {
+        File optionsFile = new File(gameDir, "options.txt");
+        if (!optionsFile.isFile()) return;
+
+        try {
+            List<String> lines = Files.readAllLines(optionsFile.toPath(), StandardCharsets.UTF_8);
+            List<String> out = new ArrayList<>();
+            boolean sawFullscreen = false;
+            boolean sawFullscreenResolution = false;
+            boolean changed = false;
+
+            for (String line : lines) {
+                if (line == null) continue;
+
+                if (line.startsWith("fullscreen:")) {
+                    sawFullscreen = true;
+                    if (!"fullscreen:false".equals(line)) changed = true;
+                    out.add("fullscreen:false");
+                } else if (line.startsWith("fullscreenResolution:")) {
+                    sawFullscreenResolution = true;
+                    if (!"fullscreenResolution:current".equals(line)) changed = true;
+                    out.add("fullscreenResolution:current");
+                } else {
+                    out.add(line);
+                }
+            }
+
+            if (!sawFullscreen) {
+                out.add("fullscreen:false");
+                changed = true;
+            }
+            if (!sawFullscreenResolution) {
+                out.add("fullscreenResolution:current");
+                changed = true;
+            }
+
+            if (changed) {
+                Files.write(optionsFile.toPath(), out, StandardCharsets.UTF_8);
+                appendLog("VulkanMod config mitigation: reset Minecraft fullscreen/options.txt monitor state");
+            }
+        } catch (Throwable throwable) {
+            appendLog("VulkanMod config mitigation: could not sanitize options.txt: " + throwable);
         }
     }
 
@@ -105,7 +214,7 @@ public final class VulkanModConfigMitigation {
             );
             return new JSONObject(text);
         } catch (Throwable throwable) {
-            Logging.i(TAG, "Invalid VulkanMod config JSON, recreating: " + configFile.getAbsolutePath());
+            appendLog("VulkanMod config mitigation: invalid config JSON, recreating: " + configFile.getAbsolutePath());
             return new JSONObject();
         }
     }
@@ -113,18 +222,21 @@ public final class VulkanModConfigMitigation {
     @Nullable
     private static File findVulkanModJar(@NonNull File gameDir) {
         File parent = gameDir.getParentFile();
+        File minecraftRoot = findMinecraftRoot(gameDir);
 
-        File[] candidates = parent != null
+        File[] candidates = minecraftRoot != null
                 ? new File[]{
                 new File(gameDir, "mods"),
-                new File(parent, "mods")
+                parent != null ? new File(parent, "mods") : null,
+                new File(minecraftRoot, "mods")
         }
                 : new File[]{
-                new File(gameDir, "mods")
+                new File(gameDir, "mods"),
+                parent != null ? new File(parent, "mods") : null
         };
 
         for (File dir : candidates) {
-            if (!dir.isDirectory()) continue;
+            if (dir == null || !dir.isDirectory()) continue;
 
             File[] files = dir.listFiles();
             if (files == null) continue;
@@ -133,8 +245,13 @@ public final class VulkanModConfigMitigation {
                 if (!file.isFile()) continue;
 
                 String name = file.getName();
-                if (!name.toLowerCase().endsWith(".jar")) continue;
-                if (!name.toLowerCase().contains("vulkanmod")) continue;
+                String lowerName = name.toLowerCase(java.util.Locale.ROOT);
+                if (!lowerName.endsWith(".jar")) continue;
+                if (!lowerName.contains("vulkanmod")) continue;
+
+                // Do not select helper/library jars like vulkanMod-android-libs-0.2.0.jar.
+                // We need the real VulkanMod jar, otherwise version parsing sees 0.2.0 and skips.
+                if (lowerName.contains("android-libs") || lowerName.contains("android_libs")) continue;
 
                 return file;
             }
@@ -144,10 +261,28 @@ public final class VulkanModConfigMitigation {
     }
 
     @Nullable
-    private static String extractVersion(@NonNull String fileName) {
-        Matcher matcher = VERSION_PATTERN.matcher(fileName);
-        if (!matcher.find()) return null;
-        return matcher.group(1);
+    private static File findMinecraftRoot(@Nullable File start) {
+        File cursor = start;
+        while (cursor != null) {
+            if (".minecraft".equals(cursor.getName())) return cursor;
+            cursor = cursor.getParentFile();
+        }
+        return null;
+    }
+
+    @Nullable
+    private static String extractVulkanModVersion(@NonNull String fileName) {
+        Matcher afterDash = VERSION_AFTER_DASH_PATTERN.matcher(fileName);
+        if (afterDash.find()) {
+            return afterDash.group(1);
+        }
+
+        Matcher any = ANY_VERSION_PATTERN.matcher(fileName);
+        String last = null;
+        while (any.find()) {
+            last = any.group(1);
+        }
+        return last;
     }
 
     private static int compareVersions(@NonNull String first, @NonNull String second) {
@@ -174,6 +309,14 @@ public final class VulkanModConfigMitigation {
             return Integer.parseInt(parts[index]);
         } catch (Throwable ignored) {
             return 0;
+        }
+    }
+
+    private static void appendLog(@NonNull String message) {
+        try {
+            Logger.appendToLog(message);
+        } catch (Throwable ignored) {
+            Logging.i(TAG, message);
         }
     }
 }

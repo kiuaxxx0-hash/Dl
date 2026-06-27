@@ -110,6 +110,7 @@ public class UnpackComponentsTask extends AbstractUnpackTask {
                 return PathManager.DIR_DATA;
 
             case LWJGL3:
+            case LWJGL333_BTA:
             case LWJGL341:
             case OTHER_LOGIN:
             case CACIOCAVALLO:

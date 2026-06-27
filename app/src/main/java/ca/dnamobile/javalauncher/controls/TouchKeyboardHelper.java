@@ -14,15 +14,12 @@ package ca.dnamobile.javalauncher.controls;
 
 import android.content.Context;
 import android.graphics.Color;
-import android.graphics.Typeface;
-import android.graphics.drawable.GradientDrawable;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
 import android.text.Editable;
 import android.text.InputType;
 import android.text.TextWatcher;
-import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.View;
 import android.view.ViewGroup;
@@ -32,8 +29,6 @@ import android.view.inputmethod.InputConnectionWrapper;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.EditText;
 import android.widget.FrameLayout;
-import android.widget.LinearLayout;
-import android.widget.TextView;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
@@ -45,12 +40,16 @@ import java.lang.reflect.Method;
 import ca.dnamobile.javalauncher.feature.log.Logging;
 
 /**
- * Runtime Android keyboard bridge for touch controls.
+ * Android IME bridge for Minecraft's LWJGL text input.
  *
- * Android IMEs always open from the bottom of the screen, so this helper keeps the
- * system keyboard as-is and adds a small top overlay showing what the user is typing.
+ * Minecraft text boxes are not Android EditText widgets. This helper therefore
+ * creates a tiny invisible Android EditText only to own the Android IME, then
+ * forwards committed text/backspace/Done into Minecraft through the existing
+ * GLFW bridge. There is no visible DroidBridge text dialog anymore; Minecraft's
+ * own chat/input field stays visible because GameImeViewportController visually
+ * pushes the Minecraft surface above the Android keyboard without resizing GLFW.
  */
-final class TouchKeyboardHelper {
+public final class TouchKeyboardHelper {
     private static final String TAG = "TouchKeyboardHelper";
 
     private static final int GLFW_PRESS_KEY_ENTER = 257;
@@ -60,62 +59,119 @@ final class TouchKeyboardHelper {
     private static final long CHAT_KEYBOARD_MODE_GRACE_MS = 10_000L;
     static final String DEFAULT_WORLD_NAME_TEXT = "New World";
 
-    @Nullable private static KeyboardInputOverlay activeOverlay;
+    @Nullable private static NativeKeyboardInputView activeInput;
     private static long lastChatKeyPressUptimeMs;
+    private static boolean chatImeSessionActive;
 
     private TouchKeyboardHelper() {
     }
 
-    static void showKeyboard(@NonNull View source) {
-        // Capture the mode at the moment the keyboard is opened.
-        // In the normal game view, Minecraft is grabbing input, so Done/Enter
-        // should submit chat. If the player pressed the launcher Chat/T key and
-        // then opened the Android keyboard, Minecraft may already have released
-        // grab for the chat screen, so keep a short chat grace window too.
-        // Menu text fields such as Create World name are opened through
-        // showMenuTextKeyboard(...) so they use DONE instead.
-        showKeyboard(source, shouldSubmitWithEnterByDefault(), null, false);
+    public static void showKeyboard(@NonNull View source) {
+        if (CallbackBridge.isGrabbing()) {
+            /*
+             * Do not let the standalone Input action push the game halfway up.
+             * The FCL/FoldCraft behavior only makes sense after Minecraft chat was
+             * actually requested (T or /). Controller mappings can now bind one
+             * button to T and another to Input, or the same button to both. The T
+             * action marks the chat grace window; Input then opens the IME and
+             * attaches the viewport push. If the user presses Input by itself while
+             * still in grabbed gameplay, there is no Minecraft text field to type
+             * into, so keep the surface fullscreen and do nothing.
+             */
+            if (!shouldUseChatImeMode()) {
+                GameImeViewportController.detachActive(true);
+                GameImeViewportController.clearImeViewportInset(source);
+                Logging.i(TAG, "Android keyboard request ignored: Minecraft chat is not open/requested.");
+                return;
+            }
+
+            source.postDelayed(() -> showNativeKeyboard(source, true, true), 90L);
+            return;
+        }
+
+        // v11 was too strict here: it refused to open the Android IME unless the
+        // reflection/I-beam text-field probe had already succeeded. That made the
+        // Input button appear completely broken on Create World / World Name and
+        // on some chat/menu states where the probe cannot see Minecraft's widget.
+        //
+        // Keep the important safety rule instead: always allow the explicit Input
+        // button to open the hidden IME, but only use Minecraft Enter + viewport
+        // push for chat. Chat is detected either by the actual ChatScreen or by the
+        // recent grabbed-mode T/open-chat request, because ChatScreen reflection is
+        // not reliable across every Minecraft version. Normal menu fields stay
+        // fullscreen and Android Done only closes the IME.
+        boolean chatMode = shouldUseChatImeMode();
+        showNativeKeyboard(source, chatMode, chatMode);
     }
 
-    static void showChatKeyboard(@NonNull View source) {
+    public static void showChatKeyboard(@NonNull View source) {
         // Explicit launcher keyboard buttons are intended for Minecraft chat. Do not
         // depend on CallbackBridge.isGrabbing() here, because opening chat releases
         // mouse grab before the user presses the Android keyboard button.
-        markChatKeyPressed();
-        showKeyboard(source, true, null, false);
+        if (CallbackBridge.isGrabbing()) {
+            markChatKeyPressed();
+            sendKeyTap(84); // GLFW_KEY_T
+            source.postDelayed(() -> showNativeKeyboard(source, true, true), 90L);
+            return;
+        }
+
+        boolean chatMode = shouldUseChatImeMode();
+        showNativeKeyboard(source, chatMode, chatMode);
     }
 
-    static void showMenuTextKeyboard(@NonNull View source) {
-        showKeyboard(source, false, null, false);
+    public static void showMenuTextKeyboard(@NonNull View source) {
+        // Usually menu text boxes use Done, but when the focused Minecraft text box
+        // belongs to ChatScreen we must keep Android Enter as Minecraft Enter so
+        // commands/messages submit instead of only closing the IME. Only ChatScreen
+        // gets the FCL-style viewport push; normal menus/world-name screens stay
+        // fullscreen so the menu layout is not shifted or broken.
+        boolean chatMode = shouldUseChatImeMode();
+        showNativeKeyboard(source, chatMode, chatMode);
     }
 
-    static void showWorldNameKeyboard(@NonNull View source) {
-        // Best-effort seed for the vanilla Create World name box. Android cannot
-        // read Minecraft's internal text field, but seeding the IME makes the
-        // common "New World" flow editable without manual selection.
-        showKeyboard(source, false, DEFAULT_WORLD_NAME_TEXT, true);
+    public static void showWorldNameKeyboard(@NonNull View source) {
+        // World-name editing is a Minecraft-side text field. Do not seed a fake
+        // "New World" buffer; Android only owns the IME and Minecraft owns the field.
+        showNativeKeyboard(source, false, false);
     }
 
-    static void markChatKeyPressed() {
+    public static void markChatKeyPressed() {
+        // T and / only mean "chat will open" while Minecraft is in grabbed
+        // gameplay mode. In menus, T is just normal text/key input. Keep this
+        // state alive while the chat box is likely still open, even if Android's
+        // IME is minimized. That lets Input reopen the keyboard and reapply the
+        // FoldCraft-style viewport push without requiring the user to press T again.
+        if (!CallbackBridge.isGrabbing()) return;
+        chatImeSessionActive = true;
         lastChatKeyPressUptimeMs = SystemClock.uptimeMillis();
     }
 
+    private static void clearChatImeState() {
+        chatImeSessionActive = false;
+        lastChatKeyPressUptimeMs = 0L;
+    }
+
     private static boolean shouldSubmitWithEnterByDefault() {
-        if (CallbackBridge.isGrabbing()) return true;
+        if (chatImeSessionActive) return true;
         long ageMs = SystemClock.uptimeMillis() - lastChatKeyPressUptimeMs;
         return ageMs >= 0L && ageMs <= CHAT_KEYBOARD_MODE_GRACE_MS;
     }
 
-    static void showKeyboard(@NonNull View source, boolean submitSendsEnter) {
-        showKeyboard(source, submitSendsEnter, null, false);
+    private static boolean shouldUseChatImeMode() {
+        // ChatScreen reflection is not reliable on every Minecraft version/mapping.
+        // The reliable signal for the launcher Input button is the grabbed-mode
+        // T/open-chat request. Keep chatImeSessionActive after Android IME minimize
+        // because Minecraft chat can remain open while the Android keyboard is gone.
+        return MinecraftTextInputKeyboardTrigger.isMinecraftChatScreenOpen()
+                || chatImeSessionActive
+                || shouldSubmitWithEnterByDefault();
     }
 
-    private static void showKeyboard(
-            @NonNull View source,
-            boolean submitSendsEnter,
-            @Nullable String initialText,
-            boolean selectAllInitialText
-    ) {
+    static void showKeyboard(@NonNull View source, boolean submitSendsEnter) {
+        showNativeKeyboard(source, submitSendsEnter, submitSendsEnter);
+    }
+
+    private static void showNativeKeyboard(@NonNull View source, boolean submitSendsEnter, boolean pushMinecraftViewport) {
         hideKeyboard(false);
 
         View root = source.getRootView();
@@ -123,7 +179,6 @@ final class TouchKeyboardHelper {
 
         FrameLayout host = findFrameLayout(root);
         if (host == null) {
-            // Last-resort fallback. This shows the keyboard but cannot draw the preview.
             source.requestFocus();
             InputMethodManager manager = (InputMethodManager) source.getContext().getSystemService(Context.INPUT_METHOD_SERVICE);
             if (manager != null) {
@@ -132,35 +187,81 @@ final class TouchKeyboardHelper {
             return;
         }
 
-        KeyboardInputOverlay overlay = new KeyboardInputOverlay(host.getContext(), submitSendsEnter, initialText, selectAllInitialText);
-        activeOverlay = overlay;
-        host.addView(overlay, new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT
-        ));
-        overlay.openKeyboard();
+        NativeKeyboardInputView inputView = new NativeKeyboardInputView(host.getContext(), source, submitSendsEnter, pushMinecraftViewport);
+        activeInput = inputView;
+        if (pushMinecraftViewport) {
+            chatImeSessionActive = true;
+            GameImeViewportController.attach(inputView, source);
+        } else {
+            GameImeViewportController.detachActive(true);
+            GameImeViewportController.clearImeViewportInset(source);
+        }
+
+        FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(dp(host.getContext(), 1f), dp(host.getContext(), 1f));
+        params.leftMargin = -dp(host.getContext(), 8f);
+        params.topMargin = -dp(host.getContext(), 8f);
+        host.addView(inputView, params);
+        inputView.openKeyboard();
     }
 
-    static void hideKeyboard(boolean clearText) {
-        KeyboardInputOverlay overlay = activeOverlay;
-        if (overlay == null) return;
-        activeOverlay = null;
-        overlay.close(clearText);
+    public static void hideKeyboard(boolean clearText) {
+        // clearText=true is used for submit/finished text entry, so chat is done.
+        // clearText=false is used for IME hide/minimize/back where Minecraft chat
+        // may still be open. Preserve chatImeSessionActive in that case so pressing
+        // Input again reopens the Android keyboard and pushes the GLSurface back up.
+        if (clearText) {
+            clearChatImeState();
+        }
+        NativeKeyboardInputView input = activeInput;
+        if (input == null) {
+            GameImeViewportController.detachActive(true);
+            return;
+        }
+        activeInput = null;
+        input.close(clearText);
     }
 
-    static boolean isKeyboardShowing() {
-        return activeOverlay != null;
+    public static void cancelMinecraftTextInputFromGame(@Nullable View source) {
+        clearChatImeState();
+        NativeKeyboardInputView input = activeInput;
+        if (input != null) {
+            activeInput = null;
+            input.close(false);
+            return;
+        }
+        GameImeViewportController.detachActive(true);
+        if (source != null) {
+            GameImeViewportController.clearImeViewportInset(source);
+            source.requestFocus();
+        }
+    }
+
+    static void notifyImeHiddenBySystem() {
+        // Android keyboard minimize hides only the system IME. Minecraft chat can
+        // remain open. Do not clear chatImeSessionActive here; otherwise the next
+        // Input press opens a plain hidden EditText and does not push the viewport.
+        NativeKeyboardInputView input = activeInput;
+        if (input == null) {
+            GameImeViewportController.detachActive(true);
+            return;
+        }
+        activeInput = null;
+        input.closeFromSystemImeHidden();
+    }
+
+    public static boolean isKeyboardShowing() {
+        return activeInput != null;
     }
 
     static boolean isChatKeyboardShowing() {
-        KeyboardInputOverlay overlay = activeOverlay;
-        return overlay != null && overlay.submitsEnter();
+        NativeKeyboardInputView input = activeInput;
+        return input != null && input.submitsEnter();
     }
 
     static void notifyMinecraftTextChangedExternally() {
-        KeyboardInputOverlay overlay = activeOverlay;
-        if (overlay != null) {
-            overlay.rebaseAfterExternalMinecraftEdit();
+        NativeKeyboardInputView input = activeInput;
+        if (input != null) {
+            input.rebaseAfterExternalMinecraftEdit();
         }
     }
 
@@ -179,13 +280,17 @@ final class TouchKeyboardHelper {
         return null;
     }
 
+    private static int dp(@NonNull Context context, float value) {
+        return Math.round(value * context.getResources().getDisplayMetrics().density);
+    }
+
     /**
      * A normal EditText does not always report Backspace when it is already empty.
-     * That breaks Minecraft fields that already contain text before this overlay is
-     * opened, because Android thinks the overlay has nothing to delete while
+     * That breaks Minecraft fields that already contain text before this hidden IME
+     * anchor is opened, because Android thinks there is nothing to delete while
      * Minecraft still has text like "New World".
      */
-    private static final class MinecraftKeyboardEditText extends EditText {
+    private static class MinecraftKeyboardEditText extends EditText {
         MinecraftKeyboardEditText(@NonNull Context context) {
             super(context);
         }
@@ -195,6 +300,8 @@ final class TouchKeyboardHelper {
         public InputConnection onCreateInputConnection(EditorInfo outAttrs) {
             InputConnection base = super.onCreateInputConnection(outAttrs);
             if (base == null) return null;
+
+            outAttrs.imeOptions |= EditorInfo.IME_FLAG_NO_EXTRACT_UI | EditorInfo.IME_FLAG_NO_FULLSCREEN;
 
             return new InputConnectionWrapper(base, true) {
                 @Override
@@ -239,6 +346,17 @@ final class TouchKeyboardHelper {
             return super.onKeyDown(keyCode, event);
         }
 
+        @Override
+        public boolean onKeyPreIme(int keyCode, KeyEvent event) {
+            if (keyCode == KeyEvent.KEYCODE_BACK && event != null) {
+                if (event.getAction() == KeyEvent.ACTION_UP && !event.isCanceled()) {
+                    TouchKeyboardHelper.hideKeyboard(false);
+                }
+                return true;
+            }
+            return super.onKeyPreIme(keyCode, event);
+        }
+
         private boolean shouldForwardEmptyBackspace(int beforeLength, int afterLength) {
             return beforeLength > 0 && afterLength == 0 && isOverlayTextEmpty();
         }
@@ -249,128 +367,40 @@ final class TouchKeyboardHelper {
         }
     }
 
-    private static final class KeyboardInputOverlay extends FrameLayout {
+    private static final class NativeKeyboardInputView extends MinecraftKeyboardEditText {
         private final Handler handler = new Handler(Looper.getMainLooper());
-        private final LinearLayout panel;
-        private final EditText input;
-        private final TextView preview;
+        @NonNull private final View returnFocusTarget;
         private final boolean submitSendsEnter;
+        private final boolean pushMinecraftViewport;
         private String lastText = "";
         private boolean closing;
         private boolean internalChange;
 
-        KeyboardInputOverlay(
-                @NonNull Context context,
-                boolean submitSendsEnter,
-                @Nullable String initialText,
-                boolean selectAllInitialText
-        ) {
+        NativeKeyboardInputView(@NonNull Context context, @NonNull View returnFocusTarget, boolean submitSendsEnter, boolean pushMinecraftViewport) {
             super(context);
+            this.returnFocusTarget = returnFocusTarget;
             this.submitSendsEnter = submitSendsEnter;
-            setClickable(false);
-            setFocusable(false);
-            setFocusableInTouchMode(false);
-            setClipChildren(false);
-            setClipToPadding(false);
+            this.pushMinecraftViewport = pushMinecraftViewport;
 
-            panel = new LinearLayout(context);
-            panel.setOrientation(LinearLayout.VERTICAL);
-            panel.setPadding(dp(14f), dp(10f), dp(14f), dp(10f));
-            panel.setBackground(makePanelBackground());
-            panel.setClickable(true);
-            panel.setFocusable(false);
-
-            TextView title = new TextView(context);
-            title.setText("Android keyboard input");
-            title.setTextColor(Color.WHITE);
-            title.setTextSize(13f);
-            title.setTypeface(Typeface.DEFAULT_BOLD);
-            panel.addView(title, new LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT
-            ));
-
-            preview = new TextView(context);
-            preview.setText("Type here…");
-            preview.setTextColor(0xFFE0E0E0);
-            preview.setTextSize(18f);
-            preview.setSingleLine(false);
-            preview.setMinLines(1);
-            preview.setMaxLines(2);
-            preview.setPadding(0, dp(6f), 0, dp(6f));
-            panel.addView(preview, new LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT
-            ));
-
-            input = new MinecraftKeyboardEditText(context);
-            input.setSingleLine(true);
-            input.setMinLines(1);
-            input.setMaxLines(1);
-            input.setTextColor(Color.WHITE);
-            input.setHintTextColor(0xAAFFFFFF);
-            input.setTextSize(16f);
-            input.setHint("Text sent to Minecraft");
-            input.setSelectAllOnFocus(false);
-            input.setInputType(InputType.TYPE_CLASS_TEXT
+            setSingleLine(true);
+            setMinLines(1);
+            setMaxLines(1);
+            setTextColor(Color.TRANSPARENT);
+            setHintTextColor(Color.TRANSPARENT);
+            setBackgroundColor(Color.TRANSPARENT);
+            setAlpha(0.01f);
+            setCursorVisible(false);
+            setSelectAllOnFocus(false);
+            setFocusable(true);
+            setFocusableInTouchMode(true);
+            setInputType(InputType.TYPE_CLASS_TEXT
                     | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
                     | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
-            input.setImeOptions((submitSendsEnter ? EditorInfo.IME_ACTION_SEND : EditorInfo.IME_ACTION_DONE)
-                    | EditorInfo.IME_FLAG_NO_EXTRACT_UI);
-            input.setBackgroundColor(0x22000000);
-            input.setPadding(dp(8f), dp(6f), dp(8f), dp(6f));
-            panel.addView(input, new LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT
-            ));
+            setImeOptions((submitSendsEnter ? EditorInfo.IME_ACTION_SEND : EditorInfo.IME_ACTION_DONE)
+                    | EditorInfo.IME_FLAG_NO_EXTRACT_UI
+                    | EditorInfo.IME_FLAG_NO_FULLSCREEN);
 
-            LinearLayout buttons = new LinearLayout(context);
-            buttons.setOrientation(LinearLayout.HORIZONTAL);
-            buttons.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
-            buttons.setPadding(0, dp(8f), 0, 0);
-
-            TextView clear = actionText(context, "CLEAR");
-            clear.setOnClickListener(v -> {
-                if (lastText.isEmpty()) {
-                    // The Android overlay may be empty while Minecraft's focused
-                    // field still contains its default value, such as "New World".
-                    // In that case, send enough backspaces to clear Minecraft's field.
-                    sendRepeatedBackspace(DEFAULT_CLEAR_BACKSPACES);
-                } else {
-                    dispatchTextDelta(lastText, "");
-                }
-                internalChange = true;
-                input.setText("");
-                lastText = "";
-                internalChange = false;
-                updatePreview("");
-            });
-            buttons.addView(clear);
-
-            TextView enter = actionText(context, submitSendsEnter ? "ENTER" : "DONE");
-            enter.setOnClickListener(v -> submitCurrentText());
-            buttons.addView(enter);
-
-            TextView close = actionText(context, "CLOSE");
-            close.setOnClickListener(v -> TouchKeyboardHelper.hideKeyboard(false));
-            buttons.addView(close);
-
-            panel.addView(buttons, new LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT
-            ));
-
-            FrameLayout.LayoutParams panelParams = new FrameLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT,
-                    Gravity.TOP | Gravity.CENTER_HORIZONTAL
-            );
-            panelParams.leftMargin = dp(12f);
-            panelParams.rightMargin = dp(12f);
-            panelParams.topMargin = dp(12f);
-            addView(panel, panelParams);
-
-            input.addTextChangedListener(new TextWatcher() {
+            addTextChangedListener(new TextWatcher() {
                 @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) { }
                 @Override public void onTextChanged(CharSequence s, int start, int before, int count) { }
                 @Override public void afterTextChanged(Editable editable) {
@@ -378,12 +408,11 @@ final class TouchKeyboardHelper {
                     String current = editable == null ? "" : editable.toString();
                     dispatchTextDelta(lastText, current);
                     lastText = current;
-                    updatePreview(current);
                 }
             });
 
-            input.setOnEditorActionListener((v, actionId, event) -> {
-                boolean imeDoneOrSend = actionId == EditorInfo.IME_ACTION_DONE
+            setOnEditorActionListener((v, actionId, event) -> {
+                boolean editorAction = actionId == EditorInfo.IME_ACTION_DONE
                         || actionId == EditorInfo.IME_ACTION_SEND
                         || actionId == EditorInfo.IME_ACTION_GO
                         || actionId == EditorInfo.IME_ACTION_UNSPECIFIED;
@@ -391,15 +420,14 @@ final class TouchKeyboardHelper {
                         && event.getKeyCode() == KeyEvent.KEYCODE_ENTER
                         && event.getAction() == KeyEvent.ACTION_DOWN
                         && event.getRepeatCount() == 0;
-
-                if (imeDoneOrSend || enterKey) {
+                if (editorAction || enterKey) {
                     submitCurrentText();
                     return true;
                 }
                 return false;
             });
 
-            input.setOnKeyListener((v, keyCode, event) -> {
+            setOnKeyListener((v, keyCode, event) -> {
                 if (event == null || event.getAction() != KeyEvent.ACTION_DOWN) return false;
                 if (keyCode == KeyEvent.KEYCODE_BACK) {
                     TouchKeyboardHelper.hideKeyboard(false);
@@ -407,32 +435,16 @@ final class TouchKeyboardHelper {
                 }
                 return false;
             });
-
-            seedInitialText(initialText, selectAllInitialText);
-        }
-
-        private void seedInitialText(@Nullable String value, boolean selectAll) {
-            if (value == null || value.isEmpty()) return;
-            internalChange = true;
-            input.setText(value);
-            lastText = value;
-            int length = input.length();
-            try {
-                if (selectAll && length > 0) input.setSelection(0, length);
-                else input.setSelection(length);
-            } catch (Throwable ignored) {
-            }
-            internalChange = false;
-            updatePreview(value);
-        }
-
-        void openKeyboard() {
-            input.requestFocus();
-            handler.postDelayed(this::showSoftInputAgain, 80);
         }
 
         boolean submitsEnter() {
             return submitSendsEnter;
+        }
+
+        void openKeyboard() {
+            requestFocus();
+            handler.postDelayed(this::showSoftInputAgain, 60L);
+            handler.postDelayed(this::showSoftInputAgain, 160L);
         }
 
         void rebaseAfterExternalMinecraftEdit() {
@@ -440,48 +452,78 @@ final class TouchKeyboardHelper {
             handler.post(() -> {
                 if (closing) return;
                 internalChange = true;
-                input.setText("");
-                input.setSelection(0);
+                setText("");
+                setSelection(0);
                 lastText = "";
                 internalChange = false;
-                preview.setText("Minecraft chat updated from selection…");
-                input.requestFocus();
+                requestFocus();
                 showSoftInputAgain();
             });
+        }
+
+        void close(boolean clearText) {
+            closeInternal(clearText, true);
+        }
+
+        void closeFromSystemImeHidden() {
+            closeInternal(false, false);
+        }
+
+        private void closeInternal(boolean clearText, boolean hideAndroidIme) {
+            closing = true;
+            if (hideAndroidIme) {
+                InputMethodManager manager = (InputMethodManager) getContext().getSystemService(Context.INPUT_METHOD_SERVICE);
+                if (manager != null) {
+                    manager.hideSoftInputFromWindow(getWindowToken(), 0);
+                }
+            }
+            if (clearText) {
+                internalChange = true;
+                setText("");
+                lastText = "";
+                internalChange = false;
+            }
+            ViewGroup parent = (ViewGroup) getParent();
+            if (parent != null) parent.removeView(this);
+            if (pushMinecraftViewport) {
+                GameImeViewportController.detachActive(true);
+            } else {
+                GameImeViewportController.clearImeViewportInset(returnFocusTarget);
+            }
+            returnFocusTarget.requestFocus();
         }
 
         private void showSoftInputAgain() {
             InputMethodManager manager = (InputMethodManager) getContext().getSystemService(Context.INPUT_METHOD_SERVICE);
             if (manager != null) {
-                manager.showSoftInput(input, InputMethodManager.SHOW_IMPLICIT);
+                manager.showSoftInput(this, InputMethodManager.SHOW_IMPLICIT);
             }
-        }
-
-        void close(boolean clearText) {
-            closing = true;
-            InputMethodManager manager = (InputMethodManager) getContext().getSystemService(Context.INPUT_METHOD_SERVICE);
-            if (manager != null) {
-                manager.hideSoftInputFromWindow(input.getWindowToken(), 0);
-            }
-            if (clearText) input.setText("");
-            ViewGroup parent = (ViewGroup) getParent();
-            if (parent != null) parent.removeView(this);
         }
 
         private void submitCurrentText() {
-            // Text is sent as the user types. In menu text fields such as the
-            // Create World name box, Android Enter/Done must only close this IME
-            // overlay. Pressing Minecraft Enter there activates the focused
-            // button and can create the world by accident.
-            if (submitSendsEnter) {
+            // Text is sent as the user types. For Minecraft menus/world name,
+            // Android Done only closes the keyboard. For chat/command input,
+            // Android Enter/Send must also press Minecraft Enter.
+            if (shouldSendMinecraftEnterOnSubmit()) {
                 sendKeyTap(GLFW_PRESS_KEY_ENTER);
             }
             TouchKeyboardHelper.hideKeyboard(true);
         }
 
-        private void updatePreview(@NonNull String value) {
-            String trimmed = value.trim();
-            preview.setText(trimmed.isEmpty() ? "Type here…" : value);
+        @Override
+        public boolean onKeyDown(int keyCode, KeyEvent event) {
+            if ((keyCode == KeyEvent.KEYCODE_ENTER || keyCode == KeyEvent.KEYCODE_NUMPAD_ENTER)
+                    && event != null
+                    && event.getRepeatCount() == 0) {
+                submitCurrentText();
+                return true;
+            }
+            return super.onKeyDown(keyCode, event);
+        }
+
+        private boolean shouldSendMinecraftEnterOnSubmit() {
+            return submitSendsEnter
+                    || MinecraftTextInputKeyboardTrigger.isMinecraftChatScreenOpen();
         }
 
         private void dispatchTextDelta(@NonNull String oldText, @NonNull String newText) {
@@ -510,11 +552,7 @@ final class TouchKeyboardHelper {
                 for (int i = 0; i < inserted.length(); i++) {
                     char c = inserted.charAt(i);
                     if (c == '\n' || c == '\r') {
-                        // Some IMEs insert a newline instead of sending the Done
-                        // editor action. Only forward that as Minecraft Enter in
-                        // in-game/chat mode. In menu text fields, close the IME
-                        // without pressing Minecraft Enter.
-                        if (submitSendsEnter) {
+                        if (shouldSendMinecraftEnterOnSubmit()) {
                             sendKeyTap(GLFW_PRESS_KEY_ENTER);
                         }
                         TouchKeyboardHelper.hideKeyboard(true);
@@ -523,30 +561,6 @@ final class TouchKeyboardHelper {
                     }
                 }
             }
-        }
-
-        private TextView actionText(@NonNull Context context, @NonNull String text) {
-            TextView view = new TextView(context);
-            view.setText(text);
-            view.setTextColor(0xFF7EE787);
-            view.setTextSize(13f);
-            view.setTypeface(Typeface.DEFAULT_BOLD);
-            view.setGravity(Gravity.CENTER);
-            view.setPadding(dp(14f), dp(8f), dp(14f), dp(8f));
-            return view;
-        }
-
-        @NonNull
-        private GradientDrawable makePanelBackground() {
-            GradientDrawable drawable = new GradientDrawable();
-            drawable.setColor(0xEE202124);
-            drawable.setStroke(Math.max(1, dp(1.5f)), 0x88FFFFFF);
-            drawable.setCornerRadius(dp(18f));
-            return drawable;
-        }
-
-        private int dp(float value) {
-            return Math.round(value * getResources().getDisplayMetrics().density);
         }
     }
 
@@ -566,22 +580,14 @@ final class TouchKeyboardHelper {
     private static boolean sendCharByReflection(char c) {
         Class<?> clazz = CallbackBridge.class;
         Object[][] attempts = new Object[][]{
-                // Pojav/Zalith-style bridge: public static void sendChar(char, int).
-                // This is the path Minecraft chat/text boxes actually listen to.
                 {"sendChar", new Class[]{char.class, int.class}, new Object[]{c, CallbackBridge.getCurrentMods()}},
                 {"sendChar", new Class[]{char.class, int.class}, new Object[]{c, 0}},
-
-                // Older/alternate bridge names used by experimental ports.
                 {"sendChar", new Class[]{int.class}, new Object[]{(int) c}},
                 {"sendChar", new Class[]{char.class}, new Object[]{c}},
                 {"sendCharMods", new Class[]{int.class, int.class}, new Object[]{(int) c, CallbackBridge.getCurrentMods()}},
                 {"sendCharMods", new Class[]{char.class, int.class}, new Object[]{c, CallbackBridge.getCurrentMods()}},
                 {"putChar", new Class[]{int.class}, new Object[]{(int) c}},
                 {"putCharEvent", new Class[]{int.class}, new Object[]{(int) c}},
-
-                // Last reflection option: use CallbackBridge.sendKeycode(...) with key=0
-                // and a real keychar. This triggers the bridge char callback without
-                // needing to expose nativeSendChar directly.
                 {"sendKeycode", new Class[]{int.class, char.class, int.class, int.class, boolean.class}, new Object[]{0, c, 0, CallbackBridge.getCurrentMods(), true}}
         };
 

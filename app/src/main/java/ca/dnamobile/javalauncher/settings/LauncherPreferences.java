@@ -16,6 +16,7 @@ import android.content.Context;
 import android.content.SharedPreferences;
 
 import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 
 public final class LauncherPreferences {
     private static final String PREFS_NAME = "launcher_preferences";
@@ -31,6 +32,8 @@ public final class LauncherPreferences {
     private static final String KEY_USE_OPENGL_FOR_MC_26_PLUS = "use_opengl_for_mc_26_plus";
     private static final String KEY_SHOW_GAME_LOG_OVERLAY = "show_game_log_overlay";
     private static final String KEY_SHOW_IN_GAME_SETTINGS_BUTTON = "show_in_game_settings_button";
+    private static final String KEY_ANDROID_BACK_OPENS_IN_GAME_MENU = "android_back_opens_in_game_menu";
+    private static final String KEY_APP_ORIENTATION_MODE = "app_orientation_mode";
     private static final String KEY_ENABLE_SDL_CONTROLLER_MOD_COMPAT = "enable_sdl_controller_mod_compat";
     private static final String KEY_SHOW_CONTROLLER_MOD_COMPAT_WARNINGS = "show_controller_mod_compat_warnings";
     private static final String KEY_FORCE_SDL_CONTROLLER_BRIDGE = "force_sdl_controller_bridge";
@@ -39,13 +42,69 @@ public final class LauncherPreferences {
     private static final String KEY_FORCE_FULLSCREEN_MODE = "force_fullscreen_mode";
     private static final String KEY_AVOID_ROUNDED_DISPLAY_CORNERS = "avoid_rounded_display_corners";
     private static final String KEY_IGNORE_DISPLAY_CUTOUT = "ignore_display_cutout";
+    private static final String KEY_LAUNCHER_THEME = "launcher_theme";
 
     public static final int MIN_GAME_RESOLUTION_SCALE_PERCENT = 25;
     public static final int MAX_GAME_RESOLUTION_SCALE_PERCENT = 200;
     public static final int DEFAULT_GAME_RESOLUTION_SCALE_PERCENT = 100;
 
+    public static final String APP_ORIENTATION_AUTO = "auto";
+    public static final String APP_ORIENTATION_LANDSCAPE = "landscape";
+    public static final String APP_ORIENTATION_REVERSE_LANDSCAPE = "reverse_landscape";
+    public static final String APP_ORIENTATION_PORTRAIT = "portrait";
+    public static final String APP_ORIENTATION_REVERSE_PORTRAIT = "reverse_portrait";
+
     private static final String DEFAULT_RENDERER_IDENTIFIER = "e7b90ed6-e518-4d4e-93dc-5c7133cd5b31";
     private static final String DEFAULT_VULKAN_DRIVER_NAME = "Default Mesa driver";
+
+
+    public static final String LAUNCHER_THEME_LIGHT = "light";
+    public static final String LAUNCHER_THEME_DARK = "dark";
+    public static final String LAUNCHER_THEME_ORANGE = "orange";
+    public static final String LAUNCHER_THEME_RED = "red";
+    public static final String LAUNCHER_THEME_YELLOW = "yellow";
+    public static final String LAUNCHER_THEME_GREEN = "green";
+    public static final String LAUNCHER_THEME_BLUE = "blue";
+    public static final String LAUNCHER_THEME_INDIGO = "indigo";
+    public static final String LAUNCHER_THEME_VIOLET = "violet";
+    public static final String LAUNCHER_THEME_PINK = "pink";
+    public static final String LAUNCHER_THEME_RAINBOW = "rainbow";
+    public static final String LAUNCHER_THEME_PURPLE = "purple";
+    public static final String LAUNCHER_THEME_MONO = "mono";
+
+    @NonNull
+    public static String getLauncherTheme(@NonNull Context context) {
+        String value = prefs(context).getString(KEY_LAUNCHER_THEME, LAUNCHER_THEME_ORANGE);
+        return normalizeLauncherTheme(value);
+    }
+
+    public static void setLauncherTheme(@NonNull Context context, @NonNull String theme) {
+        prefs(context).edit()
+                .putString(KEY_LAUNCHER_THEME, normalizeLauncherTheme(theme))
+                .commit();
+    }
+
+    @NonNull
+    public static String normalizeLauncherTheme(@Nullable String theme) {
+        if (theme == null) return LAUNCHER_THEME_ORANGE;
+        String value = theme.trim().toLowerCase(java.util.Locale.ROOT);
+        if (LAUNCHER_THEME_LIGHT.equals(value)
+                || LAUNCHER_THEME_DARK.equals(value)
+                || LAUNCHER_THEME_ORANGE.equals(value)
+                || LAUNCHER_THEME_RED.equals(value)
+                || LAUNCHER_THEME_YELLOW.equals(value)
+                || LAUNCHER_THEME_GREEN.equals(value)
+                || LAUNCHER_THEME_BLUE.equals(value)
+                || LAUNCHER_THEME_INDIGO.equals(value)
+                || LAUNCHER_THEME_VIOLET.equals(value)
+                || LAUNCHER_THEME_PINK.equals(value)
+                || LAUNCHER_THEME_RAINBOW.equals(value)
+                || LAUNCHER_THEME_PURPLE.equals(value)
+                || LAUNCHER_THEME_MONO.equals(value)) {
+            return value;
+        }
+        return LAUNCHER_THEME_ORANGE;
+    }
 
     private LauncherPreferences() {
     }
@@ -244,6 +303,51 @@ public final class LauncherPreferences {
 
     public static void setShowInGameSettingsButton(@NonNull Context context, boolean enabled) {
         saveBoolean(context, KEY_SHOW_IN_GAME_SETTINGS_BUTTON, enabled);
+    }
+
+    /**
+     * When enabled, Android navigation Back / gesture Back opens the same in-game
+     * launcher menu as the floating settings cog. When disabled, Android Back is
+     * consumed while Minecraft is running so it does not accidentally close the game
+     * or get translated into Minecraft Escape.
+     */
+    public static boolean isAndroidBackOpensInGameMenu(@NonNull Context context) {
+        return prefs(context).getBoolean(KEY_ANDROID_BACK_OPENS_IN_GAME_MENU, true);
+    }
+
+    public static void setAndroidBackOpensInGameMenu(@NonNull Context context, boolean enabled) {
+        saveBoolean(context, KEY_ANDROID_BACK_OPENS_IN_GAME_MENU, enabled);
+    }
+
+    /**
+     * Controls whether DroidBridge follows device rotation or locks launcher/game
+     * screens to a specific physical orientation. Auto mode allows all four launcher
+     * rotations; GameActivity narrows auto mode to landscape/reverse-landscape so
+     * the Minecraft GL surface never rotates into portrait during play.
+     */
+    @NonNull
+    public static String getAppOrientationMode(@NonNull Context context) {
+        String value = prefs(context).getString(KEY_APP_ORIENTATION_MODE, APP_ORIENTATION_AUTO);
+        return normalizeAppOrientationMode(value);
+    }
+
+    public static void setAppOrientationMode(@NonNull Context context, @NonNull String mode) {
+        prefs(context).edit()
+                .putString(KEY_APP_ORIENTATION_MODE, normalizeAppOrientationMode(mode))
+                .commit();
+    }
+
+    @NonNull
+    public static String normalizeAppOrientationMode(@NonNull String mode) {
+        if (mode == null) return APP_ORIENTATION_AUTO;
+        String value = mode.trim().toLowerCase(java.util.Locale.ROOT);
+        if (APP_ORIENTATION_LANDSCAPE.equals(value)
+                || APP_ORIENTATION_REVERSE_LANDSCAPE.equals(value)
+                || APP_ORIENTATION_PORTRAIT.equals(value)
+                || APP_ORIENTATION_REVERSE_PORTRAIT.equals(value)) {
+            return value;
+        }
+        return APP_ORIENTATION_AUTO;
     }
 
     /**

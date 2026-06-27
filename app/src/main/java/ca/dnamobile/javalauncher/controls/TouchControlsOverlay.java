@@ -60,6 +60,7 @@ import androidx.annotation.Nullable;
 
 import java.io.File;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.UUID;
 import java.util.Locale;
 import java.util.List;
@@ -69,6 +70,7 @@ import org.lwjgl.glfw.CallbackBridge;
 
 import ca.dnamobile.javalauncher.feature.log.Logging;
 import ca.dnamobile.javalauncher.input.GameCursorOverlay;
+import ca.dnamobile.javalauncher.ui.LauncherDialogStyle;
 import ca.dnamobile.javalauncher.utils.path.PathManager;
 import net.kdt.pojavlaunch.MinecraftGLSurface;
 import net.kdt.pojavlaunch.LwjglGlfwKeycode;
@@ -96,6 +98,9 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
     @Nullable private File layoutFile;
     @NonNull private TouchControlsLayoutData layoutData = TouchControlsLayoutData.defaultLayout();
     @Nullable private AppMenuListener appMenuListener;
+    @Nullable private String bulkAppearanceUndoSnapshot;
+    @Nullable private String editorSessionStartSnapshot;
+
     @Nullable private View passthroughTarget;
 
     /**
@@ -150,8 +155,11 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
     private boolean keySenderKeyboardVisible;
     @Nullable private View keySenderKeyboardView;
 
+    private static final long REGRAB_TOUCH_DELTA_SUPPRESS_MS = 450L;
+
     private final Handler gestureHandler = new Handler(Looper.getMainLooper());
     private final int cameraTouchSlop;
+    private long suppressCameraDeltaUntilUptimeMs;
 
     /** Pointer ID for the right-thumb look/attack stream. */
     private int cameraPointerId = NO_POINTER_ID;
@@ -224,6 +232,40 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
 
         SwipeGestureState(@NonNull TouchControlButtonView primaryControl) {
             this.primaryControl = primaryControl;
+        }
+    }
+
+    private static final class ScaledControlItem {
+        @NonNull final TouchControlButtonView button;
+        final float baseX;
+        final float baseY;
+        final float baseWidth;
+        final float baseHeight;
+        final float scaledWidth;
+        final float scaledHeight;
+        float x;
+        float y;
+
+        ScaledControlItem(
+                @NonNull TouchControlButtonView button,
+                float baseX,
+                float baseY,
+                float baseWidth,
+                float baseHeight,
+                float scaledWidth,
+                float scaledHeight,
+                float x,
+                float y
+        ) {
+            this.button = button;
+            this.baseX = baseX;
+            this.baseY = baseY;
+            this.baseWidth = baseWidth;
+            this.baseHeight = baseHeight;
+            this.scaledWidth = scaledWidth;
+            this.scaledHeight = scaledHeight;
+            this.x = x;
+            this.y = y;
         }
     }
 
@@ -302,6 +344,7 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
 
     public void setEditMode(boolean editMode) {
         this.editMode = editMode;
+        clearRuntimeTouchRouting();
         if (editMode) hideKeySenderKeyboard();
         rebuildWhenSized();
     }
@@ -326,6 +369,19 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
         postInvalidateOnAnimation();
     }
 
+    public void refreshButtonGeometry() {
+        rebuildWhenSized();
+    }
+
+    public void beginGlobalButtonScaleChange() {
+        pushUndoSnapshot();
+    }
+
+    public void applyGlobalButtonScalePercent(int percent) {
+        ControlsPreferences.setGlobalButtonScalePercent(getContext(), percent);
+        rebuildWhenSized();
+    }
+
     public void toggleControlVisible() {
         setControlsVisible(!controlsVisible);
         ControlsPreferences.setTouchControlsEnabled(getContext(), controlsVisible);
@@ -335,6 +391,7 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
         layoutFile = TouchControlsStore.getSelectedLayoutFile(getContext());
         layoutData = TouchControlsStore.loadLayout(layoutFile);
         clearEditHistory();
+        markEditorSessionSaved();
         rebuildWhenSized();
     }
 
@@ -343,6 +400,7 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
         layoutData = TouchControlsStore.loadLayout(file);
         ControlsPreferences.setSelectedLayoutPath(getContext(), file.getAbsolutePath());
         clearEditHistory();
+        markEditorSessionSaved();
         rebuildWhenSized();
     }
 
@@ -362,6 +420,32 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
         }
     }
 
+    public void markEditorSessionSaved() {
+        editorSessionStartSnapshot = snapshotLayoutSafely();
+    }
+
+    public boolean hasEditorSessionChanges() {
+        String currentSnapshot = snapshotLayoutSafely();
+        if (currentSnapshot == null) {
+            return !undoHistory.isEmpty();
+        }
+        return editorSessionStartSnapshot == null || !currentSnapshot.equals(editorSessionStartSnapshot);
+    }
+
+    public void discardEditorSessionChanges() {
+        if (editorSessionStartSnapshot == null) return;
+        try {
+            restoreEditSnapshot(editorSessionStartSnapshot);
+            saveLayout();
+            clearEditHistory();
+            markEditorSessionSaved();
+            rebuildWhenSized();
+        } catch (Throwable throwable) {
+            Logging.e(TAG, "Unable to discard touch editor changes", throwable);
+            Toast.makeText(getContext(), "Unable to discard touch changes.", Toast.LENGTH_LONG).show();
+        }
+    }
+
     public void addControl(@NonNull TouchControlData data) {
         pushUndoSnapshot();
         layoutData.controls.add(data);
@@ -375,7 +459,7 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
             String current = snapshotLayout();
             String previous = undoHistory.removeLast();
             pushBounded(redoHistory, current);
-            layoutData = TouchControlsLayoutData.fromJson(new JSONObject(previous));
+            restoreEditSnapshot(previous);
             saveLayout();
             rebuildWhenSized();
             return true;
@@ -391,7 +475,7 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
             String current = snapshotLayout();
             String next = redoHistory.removeLast();
             pushBounded(undoHistory, current);
-            layoutData = TouchControlsLayoutData.fromJson(new JSONObject(next));
+            restoreEditSnapshot(next);
             saveLayout();
             rebuildWhenSized();
             return true;
@@ -432,7 +516,37 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
 
     @NonNull
     private String snapshotLayout() throws Exception {
-        return layoutData.toJson().toString();
+        JSONObject root = new JSONObject();
+        root.put("format", "DroidBridgeTouchControlsEditorState");
+        root.put("version", 1);
+        root.put("globalButtonScalePercent", ControlsPreferences.getGlobalButtonScalePercent(getContext()));
+        root.put("globalOpacity", ControlsPreferences.getGlobalOpacity(getContext()));
+        root.put("layout", layoutData.toJson());
+        return root.toString();
+    }
+
+    private void restoreEditSnapshot(@NonNull String snapshot) throws Exception {
+        JSONObject root = new JSONObject(snapshot);
+        JSONObject layout = root.optJSONObject("layout");
+        if (layout != null) {
+            int scalePercent = root.optInt(
+                    "globalButtonScalePercent",
+                    ControlsPreferences.DEFAULT_GLOBAL_BUTTON_SCALE_PERCENT
+            );
+            ControlsPreferences.setGlobalButtonScalePercent(getContext(), scalePercent);
+            if (root.has("globalOpacity")) {
+                ControlsPreferences.setGlobalOpacity(
+                        getContext(),
+                        (float) root.optDouble("globalOpacity", ControlsPreferences.getGlobalOpacity(getContext()))
+                );
+            }
+            layoutData = TouchControlsLayoutData.fromJson(layout);
+            return;
+        }
+
+        // Backward compatibility for undo entries captured before editor-state
+        // snapshots stored the global scale preference alongside the layout JSON.
+        layoutData = TouchControlsLayoutData.fromJson(root);
     }
 
     private void clearEditHistory() {
@@ -472,28 +586,59 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
         int parentHeight = Math.max(1, getHeight());
         LayoutMetrics metrics = layoutMetrics(parentWidth, parentHeight);
         float density = getResources().getDisplayMetrics().density;
+        float scale = globalButtonScaleMultiplier();
+        ArrayList<ScaledControlItem> scaledItems = new ArrayList<>();
+
         for (TouchControlData control : layoutData.controls) {
             if (!editMode && !shouldCreateControlButton(control)) continue;
             TouchControlButtonView button = new TouchControlButtonView(getContext(), control, this);
             button.setEditMode(editMode);
             button.setVisibility(shouldShowControlButton(control) ? VISIBLE : INVISIBLE);
-            int width = Math.min(metrics.toScreenWidth(control.width), parentWidth);
-            int height = Math.min(metrics.toScreenHeight(control.height), parentHeight);
+
+            int baseWidth = baseControlScreenWidth(metrics, control, parentWidth);
+            int baseHeight = baseControlScreenHeight(metrics, control, parentHeight);
+            int width = scaledControlScreenWidth(metrics, control, parentWidth);
+            int height = scaledControlScreenHeight(metrics, control, parentHeight);
+            if (TouchControlActions.JOYSTICK.equals(control.action)) {
+                int baseSquare = Math.max(1, Math.min(Math.min(parentWidth, parentHeight), Math.max(baseWidth, baseHeight)));
+                int scaledSquare = Math.max(1, Math.min(Math.min(parentWidth, parentHeight), Math.max(width, height)));
+                baseWidth = baseSquare;
+                baseHeight = baseSquare;
+                width = scaledSquare;
+                height = scaledSquare;
+            }
+
             FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(width, height);
             addView(button, params);
 
-            float fallbackX = metrics.toScreenX(control, width);
-            float fallbackY = metrics.toScreenY(control, height);
-            float resolvedX = control.rawX == null
+            float fallbackX = metrics.toScreenX(control, baseWidth);
+            float fallbackY = metrics.toScreenY(control, baseHeight);
+            float baseX = control.rawX == null
                     ? fallbackX
-                    : ExpressionResolver.resolve(control.rawX, fallbackX, parentWidth, parentHeight, width, height, density, layoutData.preferredScale, metrics.formulaPixelScale);
-            float resolvedY = control.rawY == null
+                    : ExpressionResolver.resolve(control.rawX, fallbackX, parentWidth, parentHeight, baseWidth, baseHeight, density, layoutData.preferredScale, metrics.formulaPixelScale);
+            float baseY = control.rawY == null
                     ? fallbackY
-                    : ExpressionResolver.resolve(control.rawY, fallbackY, parentWidth, parentHeight, width, height, density, layoutData.preferredScale, metrics.formulaPixelScale);
-            resolvedX = Math.max(0f, Math.min(Math.max(0, parentWidth - width), resolvedX));
-            resolvedY = Math.max(0f, Math.min(Math.max(0, parentHeight - height), resolvedY));
-            button.setX(resolvedX);
-            button.setY(resolvedY);
+                    : ExpressionResolver.resolve(control.rawY, fallbackY, parentWidth, parentHeight, baseWidth, baseHeight, density, layoutData.preferredScale, metrics.formulaPixelScale);
+
+            float resolvedX = scaledControlScreenX(baseX, baseWidth, width, parentWidth, scale);
+            float resolvedY = scaledControlScreenY(baseY, baseHeight, height, parentHeight, scale);
+            scaledItems.add(new ScaledControlItem(
+                    button,
+                    baseX,
+                    baseY,
+                    baseWidth,
+                    baseHeight,
+                    width,
+                    height,
+                    resolvedX,
+                    resolvedY
+            ));
+        }
+
+        keepAttachedScaledControlsInsideScreen(scaledItems, parentWidth, parentHeight);
+        for (ScaledControlItem item : scaledItems) {
+            item.button.setX(item.x);
+            item.button.setY(item.y);
         }
 
         if (keySenderKeyboardVisible && !editMode) {
@@ -770,7 +915,11 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
             if (!grabbed && ControlsPreferences.isVirtualMouseEnabled(getContext())) {
                 resetVirtualMouseCursorToCenter(true);
             } else if (grabbed) {
+                suppressCameraDeltaUntilUptimeMs = SystemClock.uptimeMillis() + REGRAB_TOUCH_DELTA_SUPPRESS_MS;
+                cancelCameraPointer(true);
+                cancelAllMousePassThroughPointers();
                 cancelVirtualMousePointer();
+                passthroughPointerId = NO_POINTER_ID;
                 applyAndroidPointerIconPolicy(false);
             }
             applyControlsVisualStateForGrabState(grabbed);
@@ -853,7 +1002,7 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
         // Hidden controls should still allow hotbar taps, camera dragging, and menu passthrough
         // through the same safe routing path instead of dropping to the raw SurfaceView path.
         if (editMode) {
-            return super.dispatchTouchEvent(event);
+            return dispatchEditModeTouchEvent(event);
         }
 
         if (dispatchKeySenderKeyboardTouch(event)) {
@@ -996,6 +1145,98 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
         return editMode && super.onTouchEvent(event);
     }
 
+    private boolean dispatchEditModeTouchEvent(@NonNull MotionEvent event) {
+        int action = event.getActionMasked();
+        int actionIndex = event.getActionIndex();
+
+        switch (action) {
+            case MotionEvent.ACTION_DOWN:
+                controlPointerTargets.clear();
+                return dispatchEditControlDown(event, actionIndex) || super.dispatchTouchEvent(event);
+
+            case MotionEvent.ACTION_POINTER_DOWN:
+                return dispatchEditControlDown(event, actionIndex) || super.dispatchTouchEvent(event);
+
+            case MotionEvent.ACTION_MOVE:
+                if (controlPointerTargets.size() > 0) {
+                    dispatchActiveControlPointers(event, MotionEvent.ACTION_MOVE);
+                    return true;
+                }
+                return super.dispatchTouchEvent(event);
+
+            case MotionEvent.ACTION_POINTER_UP:
+                if (dispatchEditPointerUp(event, actionIndex)) return true;
+                return super.dispatchTouchEvent(event);
+
+            case MotionEvent.ACTION_UP:
+                if (dispatchEditPointerUp(event, actionIndex)) {
+                    controlPointerTargets.clear();
+                    return true;
+                }
+                controlPointerTargets.clear();
+                return super.dispatchTouchEvent(event);
+
+            case MotionEvent.ACTION_CANCEL:
+                if (controlPointerTargets.size() > 0) {
+                    dispatchCancelToControlPointers(event);
+                    controlPointerTargets.clear();
+                    return true;
+                }
+                return super.dispatchTouchEvent(event);
+
+            default:
+                return super.dispatchTouchEvent(event);
+        }
+    }
+
+    private boolean dispatchEditControlDown(@NonNull MotionEvent event, int pointerIndex) {
+        if (pointerIndex < 0 || pointerIndex >= event.getPointerCount()) return false;
+        float x = event.getX(pointerIndex);
+        float y = event.getY(pointerIndex);
+
+        // Route every editor button touch by pointer ID instead of relying on the
+        // normal Android child dispatch path. This keeps taps reliable even with
+        // translated controls, overlapping buttons, and the resize handle hanging
+        // outside the lower-right corner. Prefer the resize handle when it overlaps
+        // the normal button body.
+        TouchControlButtonView control = findResizeHandleControlUnder(x, y);
+        if (control == null) {
+            control = findControlUnder(x, y);
+        }
+        if (control == null) return false;
+
+        int pointerId = event.getPointerId(pointerIndex);
+        controlPointerTargets.put(pointerId, control);
+        dispatchSinglePointerToControl(event, pointerIndex, MotionEvent.ACTION_DOWN, control);
+        return true;
+    }
+
+    private boolean dispatchEditPointerUp(@NonNull MotionEvent event, int pointerIndex) {
+        if (pointerIndex < 0 || pointerIndex >= event.getPointerCount()) return false;
+        int pointerId = event.getPointerId(pointerIndex);
+        TouchControlButtonView control = controlPointerTargets.get(pointerId);
+        if (control == null) return false;
+
+        dispatchSinglePointerToControl(event, pointerIndex, MotionEvent.ACTION_UP, control);
+        controlPointerTargets.remove(pointerId);
+        return true;
+    }
+
+    @Nullable
+    private TouchControlButtonView findResizeHandleControlUnder(float x, float y) {
+        for (int i = getChildCount() - 1; i >= 0; i--) {
+            View child = getChildAt(i);
+            if (!(child instanceof TouchControlButtonView)) continue;
+            if (child.getVisibility() != VISIBLE) continue;
+            TouchControlButtonView control = (TouchControlButtonView) child;
+            if (control.isInResizeHandleFromParent(x, y)) {
+                return control;
+            }
+        }
+        return null;
+    }
+
+
     @Override
     public void onChanged() {
         saveLayout();
@@ -1016,10 +1257,19 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
         float[] snapped = resolveDraggedPosition(view, proposedX, proposedY);
         LayoutMetrics metrics = layoutMetrics(getWidth(), getHeight());
 
-        // X/Y are stored in the layout's own units. DroidBridge layouts use dp;
-        // imported default_touch.json / Pojav-style layouts use source-canvas px.
-        data.x = metrics.fromScreenX(data, snapped[0], view.getWidth());
-        data.y = metrics.fromScreenY(snapped[1]);
+        float globalScale = globalButtonScaleMultiplier();
+        float scaledWidth = Math.max(1f, view.getWidth());
+        float scaledHeight = Math.max(1f, view.getHeight());
+        float baseWidth = Math.max(1f, scaledWidth / Math.max(0.001f, globalScale));
+        float baseHeight = Math.max(1f, scaledHeight / Math.max(0.001f, globalScale));
+        float baseX = unscaledControlScreenX(snapped[0], baseWidth, scaledWidth, getWidth(), globalScale);
+        float baseY = unscaledControlScreenY(snapped[1], baseHeight, scaledHeight, getHeight(), globalScale);
+
+        // X/Y are stored in the layout's own units at the unscaled 100% geometry.
+        // The global scale renderer then moves the button centers together, so
+        // undo/redo and per-button edits do not get polluted by the live scale.
+        data.x = metrics.fromScreenX(data, baseX, baseWidth);
+        data.y = metrics.fromScreenY(baseY);
         data.rawX = null;
         data.rawY = null;
 
@@ -1048,14 +1298,25 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
         int maxHeight = Math.max(minSize, Math.round(getHeight() - top));
         int newWidth = Math.max(minSize, Math.min(maxWidth, Math.round(proposedScreenWidth)));
         int newHeight = Math.max(minSize, Math.min(maxHeight, Math.round(proposedScreenHeight)));
+        if (TouchControlActions.JOYSTICK.equals(data.action)) {
+            int square = Math.max(minSize, Math.min(Math.min(maxWidth, maxHeight), Math.max(newWidth, newHeight)));
+            newWidth = square;
+            newHeight = square;
+        }
 
         LayoutMetrics metrics = layoutMetrics(getWidth(), getHeight());
         float oldScreenWidth = Math.max(1f, view.getWidth());
         float oldScreenHeight = Math.max(1f, view.getHeight());
         float ratio = Math.min(newWidth / oldScreenWidth, newHeight / oldScreenHeight);
 
-        data.width = Math.max(24f, metrics.fromScreenWidth(newWidth));
-        data.height = Math.max(24f, metrics.fromScreenHeight(newHeight));
+        float globalScale = globalButtonScaleMultiplier();
+        data.width = Math.max(24f, metrics.fromScreenWidth(newWidth / globalScale));
+        data.height = Math.max(24f, metrics.fromScreenHeight(newHeight / globalScale));
+        if (TouchControlActions.JOYSTICK.equals(data.action)) {
+            float squareUnits = Math.max(data.width, data.height);
+            data.width = squareUnits;
+            data.height = squareUnits;
+        }
         data.sizePercent = clamp(data.sizePercent * ratio, 30f, 250f);
         data.rawX = null;
         data.rawY = null;
@@ -1267,6 +1528,9 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
         boolean originalVisibleInGame = data.visibleInGame;
         boolean originalVisibleInMenu = data.visibleInMenu;
         boolean originalVisibleWhenControlsHidden = data.visibleWhenControlsHidden;
+        boolean originalJoystickAbsolute = data.joystickAbsolute;
+        boolean originalJoystickForwardLock = data.joystickForwardLock;
+        float originalJoystickDeadzonePercent = data.joystickDeadzonePercent;
         String originalRawX = data.rawX;
         String originalRawY = data.rawY;
 
@@ -1278,8 +1542,10 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
         float initialLayoutY = data.rawY == null ? data.y : metrics.fromScreenY(editingView.getY());
 
         ScrollView scrollView = new ScrollView(context);
+        scrollView.setBackgroundColor(LauncherDialogStyle.COLOR_DIALOG_BG);
         LinearLayout layout = new LinearLayout(context);
         layout.setOrientation(LinearLayout.VERTICAL);
+        layout.setBackgroundColor(LauncherDialogStyle.COLOR_DIALOG_BG);
         int padding = dp(18f);
         layout.setPadding(padding, dp(8f), padding, dp(10f));
         scrollView.addView(layout, new ScrollView.LayoutParams(
@@ -1288,8 +1554,8 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
         ));
 
         TextView summary = new TextView(context);
-        summary.setText("Editing: " + (data.label == null || data.label.trim().isEmpty() ? "Button" : data.label.trim()));
-        summary.setTextColor(0xFFE0E0E0);
+        summary.setText("Editing: " + displayLabelForDialog(data.label));
+        summary.setTextColor(LauncherDialogStyle.COLOR_TEXT_PRIMARY);
         summary.setTextSize(15f);
         summary.setPadding(0, 0, 0, dp(10f));
         layout.addView(summary);
@@ -1298,6 +1564,17 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
 
         EditText label = textField(context, "Button label", data.label, false);
         addFieldRow(layout, "Label", label);
+
+        CheckBox emptyLabel = new CheckBox(context);
+        emptyLabel.setText("Leave button text empty");
+        emptyLabel.setTextColor(0xFFE0E0E0);
+        emptyLabel.setChecked(data.label == null || data.label.isEmpty());
+        emptyLabel.setOnCheckedChangeListener((buttonView, checked) -> {
+            if (checked && label.getText() != null && label.getText().length() > 0) {
+                label.setText("");
+            }
+        });
+        layout.addView(emptyLabel);
 
         EditText idField = textField(context, "Stable button ID", data.id, false);
         addFieldRow(layout, "Button ID", idField);
@@ -1399,6 +1676,8 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
         }
         updateKeySlotSummary(keyCodes, boundKeys, keySlotSpinners, keyOptions);
 
+        final View[] joystickOptionViews = new View[5];
+
         AdapterView.OnItemSelectedListener actionListener = new AdapterView.OnItemSelectedListener() {
             @Override
             public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
@@ -1418,13 +1697,19 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
                         || TouchControlActions.SCROLL.equals(action) && TouchControlActions.SCROLL.equals(data.action)
                         ? TouchInputBinding.selectedOptionIndex(action, data)
                         : 0;
-                bindingSpinner.setSelection(selected, false);
+                if (options.length > 0) {
+                    bindingSpinner.setSelection(Math.max(0, Math.min(selected, options.length - 1)), false);
+                }
                 bindingSpinner.setEnabled(!keyAction && options.length > 1);
                 keyCodes.setVisibility(GONE);
                 boundKeys.setVisibility(keyAction ? VISIBLE : GONE);
                 keySlotHint.setVisibility(keyAction ? VISIBLE : GONE);
                 for (LinearLayout slotRow : keySlotRows) {
                     if (slotRow != null) slotRow.setVisibility(keyAction ? VISIBLE : GONE);
+                }
+                boolean joystickSelected = TouchControlActions.JOYSTICK.equals(action);
+                for (View joystickOptionView : joystickOptionViews) {
+                    if (joystickOptionView != null) joystickOptionView.setVisibility(joystickSelected ? VISIBLE : GONE);
                 }
             }
 
@@ -1497,6 +1782,36 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
                 || TouchControlData.shouldStayVisibleWhenControlsHiddenByDefault(data.action));
         layout.addView(visibleWhenControlsHidden);
 
+        CheckBox joystickAbsolute = new CheckBox(context);
+        joystickAbsolute.setText("Joystick center follows finger");
+        joystickAbsolute.setTextColor(0xFFE0E0E0);
+        joystickAbsolute.setChecked(data.joystickAbsolute);
+        layout.addView(joystickAbsolute);
+
+        CheckBox joystickForwardLock = new CheckBox(context);
+        joystickForwardLock.setText("Joystick forward lock / sprint edge");
+        joystickForwardLock.setTextColor(0xFFE0E0E0);
+        joystickForwardLock.setChecked(data.joystickForwardLock);
+        layout.addView(joystickForwardLock);
+
+        TextView deadzoneLabel = valueLabel(context, "Joystick deadzone: " + Math.round(TouchControlData.clampJoystickDeadzonePercent(data.joystickDeadzonePercent)) + "%");
+        layout.addView(deadzoneLabel);
+        EditText joystickDeadzone = textField(context, "Deadzone percent", String.valueOf(Math.round(TouchControlData.clampJoystickDeadzonePercent(data.joystickDeadzonePercent))), true);
+        addFieldRow(layout, "Deadzone", joystickDeadzone);
+        SeekBar joystickDeadzoneSlider = addSlider(layout, 80, Math.round(TouchControlData.clampJoystickDeadzonePercent(data.joystickDeadzonePercent)));
+        joystickOptionViews[0] = joystickAbsolute;
+        joystickOptionViews[1] = joystickForwardLock;
+        joystickOptionViews[2] = deadzoneLabel;
+        joystickOptionViews[3] = joystickDeadzone;
+        joystickOptionViews[4] = joystickDeadzoneSlider;
+
+        boolean joystickControl = TouchControlActions.JOYSTICK.equals(data.action);
+        joystickAbsolute.setVisibility(joystickControl ? VISIBLE : GONE);
+        joystickForwardLock.setVisibility(joystickControl ? VISIBLE : GONE);
+        deadzoneLabel.setVisibility(joystickControl ? VISIBLE : GONE);
+        joystickDeadzone.setVisibility(joystickControl ? VISIBLE : GONE);
+        joystickDeadzoneSlider.setVisibility(joystickControl ? VISIBLE : GONE);
+
         CheckBox mousePassThrough = new CheckBox(context);
         mousePassThrough.setText("Mouse pass through");
         mousePassThrough.setTextColor(0xFFE0E0E0);
@@ -1545,19 +1860,27 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
         float baseHeight = Math.max(24f, data.height * 100f / Math.max(1f, initialPercent));
 
         Runnable applyPreview = () -> {
-            data.label = label.getText() == null ? data.label : label.getText().toString().trim();
-            if (data.label.isEmpty()) data.label = "Button";
+            data.label = emptyLabel.isChecked() ? "" : (label.getText() == null ? data.label : label.getText().toString());
             data.x = parseFloat(x, data.x);
             data.y = parseFloat(y, data.y);
             data.width = Math.max(24f, parseFloat(width, data.width));
             data.height = Math.max(24f, parseFloat(height, data.height));
+            if (TouchControlActions.JOYSTICK.equals(data.action)) {
+                float squareSize = Math.max(data.width, data.height);
+                data.width = squareSize;
+                data.height = squareSize;
+            }
             data.opacity = clamp(parseFloat(opacity, data.opacity), 0f, 1f);
             data.cornerRadius = Math.max(0f, parseFloat(cornerRadius, data.cornerRadius));
             data.strokeWidth = Math.max(0f, parseFloat(strokeWidth, data.strokeWidth));
             data.strokeColor = parseColorValue(strokeColor.getText() == null ? "" : strokeColor.getText().toString(), data.strokeColor);
+            data.joystickAbsolute = joystickAbsolute.isChecked();
+            data.joystickForwardLock = joystickForwardLock.isChecked();
+            data.joystickDeadzonePercent = TouchControlData.clampJoystickDeadzonePercent(parseFloat(joystickDeadzone, data.joystickDeadzonePercent));
+            deadzoneLabel.setText("Joystick deadzone: " + Math.round(data.joystickDeadzonePercent) + "%");
             data.rawX = null;
             data.rawY = null;
-            summary.setText("Editing: " + data.label);
+            summary.setText("Editing: " + displayLabelForDialog(data.label));
             applyControlPreview(editingView, data);
         };
 
@@ -1575,6 +1898,7 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
                 setSliderProgress(opacitySlider, Math.round(clamp(parseFloat(opacity, data.opacity), 0f, 1f) * 100f));
                 setSliderProgress(cornerSlider, Math.round(parseFloat(cornerRadius, data.cornerRadius)));
                 setSliderProgress(strokeSlider, Math.round(parseFloat(strokeWidth, data.strokeWidth)));
+                setSliderProgress(joystickDeadzoneSlider, Math.round(TouchControlData.clampJoystickDeadzonePercent(parseFloat(joystickDeadzone, data.joystickDeadzonePercent))));
                 textChangingSlider[0] = false;
             }
         };
@@ -1587,6 +1911,7 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
         cornerRadius.addTextChangedListener(watcher);
         strokeWidth.addTextChangedListener(watcher);
         strokeColor.addTextChangedListener(watcher);
+        joystickDeadzone.addTextChangedListener(watcher);
 
         addPreviewSliderListener(xSlider, dialogRef, () -> { if (!textChangingSlider[0]) setTextFromSlider(x, xSlider); });
         addPreviewSliderListener(ySlider, dialogRef, () -> { if (!textChangingSlider[0]) setTextFromSlider(y, ySlider); });
@@ -1602,6 +1927,7 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
         });
         addPreviewSliderListener(cornerSlider, dialogRef, () -> { if (!textChangingSlider[0]) setTextFromSlider(cornerRadius, cornerSlider); });
         addPreviewSliderListener(strokeSlider, dialogRef, () -> { if (!textChangingSlider[0]) setTextFromSlider(strokeWidth, strokeSlider); });
+        addPreviewSliderListener(joystickDeadzoneSlider, dialogRef, () -> { if (!textChangingSlider[0]) setTextFromSlider(joystickDeadzone, joystickDeadzoneSlider); });
 
         sizeSlider.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override
@@ -1612,8 +1938,15 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
                 sizeLabel.setText("Button size: " + percent + "%");
                 if (fromUser) {
                     sliderChangingText[0] = true;
-                    width.setText(String.valueOf(Math.max(24, Math.round(baseWidth * percent / 100f))));
-                    height.setText(String.valueOf(Math.max(24, Math.round(baseHeight * percent / 100f))));
+                    int newWidth = Math.max(24, Math.round(baseWidth * percent / 100f));
+                    int newHeight = Math.max(24, Math.round(baseHeight * percent / 100f));
+                    if (TouchControlActions.JOYSTICK.equals(data.action)) {
+                        int squareSize = Math.max(newWidth, newHeight);
+                        newWidth = squareSize;
+                        newHeight = squareSize;
+                    }
+                    width.setText(String.valueOf(newWidth));
+                    height.setText(String.valueOf(newHeight));
                     sliderChangingText[0] = false;
                     applyPreview.run();
                 }
@@ -1672,8 +2005,12 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
                 String action = actionValues[Math.min(actionPosition, actionValues.length - 1)];
                 TouchInputBinding.Option[] options = currentOptions[0] != null ? currentOptions[0] : TouchInputBinding.optionsForAction(action);
                 int bindingPosition = Math.max(0, bindingSpinner.getSelectedItemPosition());
-                TouchInputBinding.Option option = options[Math.min(bindingPosition, options.length - 1)];
-                TouchInputBinding.applyOption(data, action, option);
+                if (options.length > 0) {
+                    TouchInputBinding.Option option = options[Math.min(bindingPosition, options.length - 1)];
+                    TouchInputBinding.applyOption(data, action, option);
+                } else {
+                    data.action = action;
+                }
 
                 if (TouchControlActions.KEY.equals(action)) {
                     data.setKeySlots(readKeySlotsFromSpinners(keySlotSpinners, keyOptions));
@@ -1684,16 +2021,24 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
                 data.id = safeControlId(idField.getText() == null ? "" : idField.getText().toString());
                 setMousePassThroughEnabled(data, mousePassThrough.isChecked());
                 setSwipeGestureEnabled(data, swipeGesture.isChecked());
-                data.label = newLabel.trim().isEmpty() ? "Button" : newLabel.trim();
+                data.label = emptyLabel.isChecked() ? "" : newLabel;
                 data.x = parseFloat(x, data.x);
                 data.y = parseFloat(y, data.y);
                 data.width = Math.max(24f, parseFloat(width, data.width));
                 data.height = Math.max(24f, parseFloat(height, data.height));
+                if (TouchControlActions.JOYSTICK.equals(data.action)) {
+                    float squareSize = Math.max(data.width, data.height);
+                    data.width = squareSize;
+                    data.height = squareSize;
+                }
                 data.sizePercent = clamp(currentPercent[0], 30f, 250f);
                 data.opacity = clamp(parseFloat(opacity, data.opacity), 0f, 1f);
                 data.cornerRadius = Math.max(0f, parseFloat(cornerRadius, data.cornerRadius));
                 data.strokeWidth = Math.max(0f, parseFloat(strokeWidth, data.strokeWidth));
                 data.strokeColor = parseColorValue(strokeColor.getText() == null ? "" : strokeColor.getText().toString(), data.strokeColor);
+                data.joystickAbsolute = joystickAbsolute.isChecked();
+                data.joystickForwardLock = joystickForwardLock.isChecked();
+                data.joystickDeadzonePercent = TouchControlData.clampJoystickDeadzonePercent(parseFloat(joystickDeadzone, data.joystickDeadzonePercent));
                 data.toggle = toggle.isChecked();
                 data.visibleInGame = visibleInGame.isChecked();
                 data.visibleInMenu = visibleInMenu.isChecked();
@@ -1733,6 +2078,9 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
                 data.visibleInGame = originalVisibleInGame;
                 data.visibleInMenu = originalVisibleInMenu;
                 data.visibleWhenControlsHidden = originalVisibleWhenControlsHidden;
+                data.joystickAbsolute = originalJoystickAbsolute;
+                data.joystickForwardLock = originalJoystickForwardLock;
+                data.joystickDeadzonePercent = originalJoystickDeadzonePercent;
                 data.rawX = originalRawX;
                 data.rawY = originalRawY;
                 rebuildWhenSized();
@@ -1747,6 +2095,67 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
             setEditDialogPreviewAlpha(dialog, false);
             Toast.makeText(context, "Unable to open touch editor.", Toast.LENGTH_LONG).show();
         }
+    }
+
+
+
+    public void beginBulkControlAppearanceChange() {
+        if (bulkAppearanceUndoSnapshot == null) {
+            bulkAppearanceUndoSnapshot = snapshotLayoutSafely();
+        }
+    }
+
+    public void applyAllButtonCornerRadius(float radius) {
+        applyAllButtonAppearance(Math.max(0f, radius), true);
+    }
+
+    public void applyAllButtonStrokeWidth(float strokeWidth) {
+        applyAllButtonAppearance(Math.max(0f, strokeWidth), false);
+    }
+
+    private void applyAllButtonAppearance(float value, boolean radius) {
+        if (layoutData.controls.isEmpty()) return;
+        if (bulkAppearanceUndoSnapshot == null) {
+            pushUndoSnapshot();
+        }
+        for (TouchControlData control : layoutData.controls) {
+            if (radius) {
+                control.cornerRadius = Math.max(0f, value);
+            } else {
+                control.strokeWidth = Math.max(0f, value);
+            }
+        }
+        saveLayout();
+        rebuildWhenSized();
+    }
+
+    public void finishBulkControlAppearanceChange() {
+        if (bulkAppearanceUndoSnapshot != null) {
+            pushUndoSnapshot(bulkAppearanceUndoSnapshot);
+            bulkAppearanceUndoSnapshot = null;
+        }
+        saveLayout();
+    }
+
+    public int averageButtonCornerRadius() {
+        if (layoutData.controls.isEmpty()) return 16;
+        float total = 0f;
+        for (TouchControlData control : layoutData.controls) total += Math.max(0f, control.cornerRadius);
+        return Math.round(total / Math.max(1, layoutData.controls.size()));
+    }
+
+    public int averageButtonStrokeWidth() {
+        if (layoutData.controls.isEmpty()) return 2;
+        float total = 0f;
+        for (TouchControlData control : layoutData.controls) total += Math.max(0f, control.strokeWidth);
+        return Math.round(total / Math.max(1, layoutData.controls.size()));
+    }
+
+    @NonNull
+    private static String displayLabelForDialog(@Nullable String label) {
+        if (label == null || label.isEmpty()) return "(empty label)";
+        String trimmed = label.trim();
+        return trimmed.isEmpty() ? "(empty label)" : trimmed;
     }
 
     @NonNull
@@ -1810,6 +2219,193 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
                 density,
                 density
         );
+    }
+
+    private float globalButtonScaleMultiplier() {
+        return Math.max(
+                ControlsPreferences.MIN_GLOBAL_BUTTON_SCALE_PERCENT,
+                Math.min(
+                        ControlsPreferences.MAX_GLOBAL_BUTTON_SCALE_PERCENT,
+                        ControlsPreferences.getGlobalButtonScalePercent(getContext())
+                )
+        ) / 100f;
+    }
+
+    private int baseControlScreenWidth(
+            @NonNull LayoutMetrics metrics,
+            @NonNull TouchControlData control,
+            int parentWidth
+    ) {
+        return Math.min(Math.max(1, parentWidth), Math.max(1, metrics.toScreenWidth(control.width)));
+    }
+
+    private int baseControlScreenHeight(
+            @NonNull LayoutMetrics metrics,
+            @NonNull TouchControlData control,
+            int parentHeight
+    ) {
+        return Math.min(Math.max(1, parentHeight), Math.max(1, metrics.toScreenHeight(control.height)));
+    }
+
+    private int scaledControlScreenWidth(
+            @NonNull LayoutMetrics metrics,
+            @NonNull TouchControlData control,
+            int parentWidth
+    ) {
+        int baseWidth = baseControlScreenWidth(metrics, control, parentWidth);
+        int scaledWidth = Math.round(baseWidth * globalButtonScaleMultiplier());
+        return Math.min(Math.max(1, parentWidth), Math.max(1, scaledWidth));
+    }
+
+    private int scaledControlScreenHeight(
+            @NonNull LayoutMetrics metrics,
+            @NonNull TouchControlData control,
+            int parentHeight
+    ) {
+        int baseHeight = baseControlScreenHeight(metrics, control, parentHeight);
+        int scaledHeight = Math.round(baseHeight * globalButtonScaleMultiplier());
+        return Math.min(Math.max(1, parentHeight), Math.max(1, scaledHeight));
+    }
+
+    private void keepAttachedScaledControlsInsideScreen(
+            @NonNull ArrayList<ScaledControlItem> items,
+            int parentWidth,
+            int parentHeight
+    ) {
+        int count = items.size();
+        if (count == 0) return;
+
+        boolean[] visited = new boolean[count];
+        float attachTolerance = Math.max(3f, 6f * getResources().getDisplayMetrics().density);
+        int[] stack = new int[count];
+
+        for (int start = 0; start < count; start++) {
+            if (visited[start]) continue;
+
+            int stackSize = 0;
+            int clusterSize = 0;
+            int[] cluster = new int[count];
+            stack[stackSize++] = start;
+            visited[start] = true;
+
+            while (stackSize > 0) {
+                int index = stack[--stackSize];
+                cluster[clusterSize++] = index;
+                ScaledControlItem current = items.get(index);
+
+                for (int other = 0; other < count; other++) {
+                    if (visited[other]) continue;
+                    if (!areBaseRectsAttached(current, items.get(other), attachTolerance)) continue;
+                    visited[other] = true;
+                    stack[stackSize++] = other;
+                }
+            }
+
+            nudgeScaledClusterInsideScreen(items, cluster, clusterSize, parentWidth, parentHeight);
+        }
+    }
+
+    private boolean areBaseRectsAttached(
+            @NonNull ScaledControlItem a,
+            @NonNull ScaledControlItem b,
+            float tolerance
+    ) {
+        float aLeft = a.baseX - tolerance;
+        float aTop = a.baseY - tolerance;
+        float aRight = a.baseX + a.baseWidth + tolerance;
+        float aBottom = a.baseY + a.baseHeight + tolerance;
+
+        float bLeft = b.baseX;
+        float bTop = b.baseY;
+        float bRight = b.baseX + b.baseWidth;
+        float bBottom = b.baseY + b.baseHeight;
+
+        return aLeft < bRight
+                && aRight > bLeft
+                && aTop < bBottom
+                && aBottom > bTop;
+    }
+
+    private void nudgeScaledClusterInsideScreen(
+            @NonNull ArrayList<ScaledControlItem> items,
+            @NonNull int[] cluster,
+            int clusterSize,
+            int parentWidth,
+            int parentHeight
+    ) {
+        if (clusterSize <= 0) return;
+
+        float left = Float.MAX_VALUE;
+        float top = Float.MAX_VALUE;
+        float right = -Float.MAX_VALUE;
+        float bottom = -Float.MAX_VALUE;
+
+        for (int i = 0; i < clusterSize; i++) {
+            ScaledControlItem item = items.get(cluster[i]);
+            left = Math.min(left, item.x);
+            top = Math.min(top, item.y);
+            right = Math.max(right, item.x + item.scaledWidth);
+            bottom = Math.max(bottom, item.y + item.scaledHeight);
+        }
+
+        float dx = 0f;
+        float dy = 0f;
+
+        if (right - left <= parentWidth) {
+            if (left < 0f) dx = -left;
+            else if (right > parentWidth) dx = parentWidth - right;
+        } else {
+            // The cluster is larger than the screen. Keep the left edge visible
+            // but do not clamp every button independently, because that breaks
+            // attached D-pads/hotbars into separated pieces.
+            dx = left < 0f ? -left : 0f;
+        }
+
+        if (bottom - top <= parentHeight) {
+            if (top < 0f) dy = -top;
+            else if (bottom > parentHeight) dy = parentHeight - bottom;
+        } else {
+            dy = top < 0f ? -top : 0f;
+        }
+
+        if (dx == 0f && dy == 0f) return;
+        for (int i = 0; i < clusterSize; i++) {
+            ScaledControlItem item = items.get(cluster[i]);
+            item.x += dx;
+            item.y += dy;
+        }
+    }
+
+    private float scaledControlScreenX(float baseX, float baseWidth, float scaledWidth, float parentWidth, float scale) {
+        if (scale <= 0.001f) scale = 1f;
+        float parentCenter = parentWidth / 2f;
+        float baseCenter = baseX + (baseWidth / 2f);
+        float scaledCenter = parentCenter + ((baseCenter - parentCenter) * scale);
+        return scaledCenter - (scaledWidth / 2f);
+    }
+
+    private float scaledControlScreenY(float baseY, float baseHeight, float scaledHeight, float parentHeight, float scale) {
+        if (scale <= 0.001f) scale = 1f;
+        float parentCenter = parentHeight / 2f;
+        float baseCenter = baseY + (baseHeight / 2f);
+        float scaledCenter = parentCenter + ((baseCenter - parentCenter) * scale);
+        return scaledCenter - (scaledHeight / 2f);
+    }
+
+    private float unscaledControlScreenX(float scaledX, float baseWidth, float scaledWidth, float parentWidth, float scale) {
+        if (scale <= 0.001f) scale = 1f;
+        float parentCenter = parentWidth / 2f;
+        float scaledCenter = scaledX + (scaledWidth / 2f);
+        float baseCenter = parentCenter + ((scaledCenter - parentCenter) / scale);
+        return baseCenter - (baseWidth / 2f);
+    }
+
+    private float unscaledControlScreenY(float scaledY, float baseHeight, float scaledHeight, float parentHeight, float scale) {
+        if (scale <= 0.001f) scale = 1f;
+        float parentCenter = parentHeight / 2f;
+        float scaledCenter = scaledY + (scaledHeight / 2f);
+        float baseCenter = parentCenter + ((scaledCenter - parentCenter) / scale);
+        return baseCenter - (baseHeight / 2f);
     }
 
     @NonNull
@@ -2060,10 +2656,12 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
 
     private void applyControlPreview(@NonNull TouchControlButtonView view, @NonNull TouchControlData data) {
         LayoutMetrics metrics = layoutMetrics(getWidth(), getHeight());
-        int width = metrics.toScreenWidth(data.width);
-        int height = metrics.toScreenHeight(data.height);
-        width = Math.min(width, Math.max(1, getWidth()));
-        height = Math.min(height, Math.max(1, getHeight()));
+        int parentWidth = Math.max(1, getWidth());
+        int parentHeight = Math.max(1, getHeight());
+        int baseWidth = baseControlScreenWidth(metrics, data, parentWidth);
+        int baseHeight = baseControlScreenHeight(metrics, data, parentHeight);
+        int width = scaledControlScreenWidth(metrics, data, parentWidth);
+        int height = scaledControlScreenHeight(metrics, data, parentHeight);
 
         ViewGroup.LayoutParams params = view.getLayoutParams();
         if (params != null) {
@@ -2072,8 +2670,13 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
             view.setLayoutParams(params);
         }
 
-        view.setX(clamp(metrics.toScreenX(data, width), 0f, Math.max(0f, getWidth() - width)));
-        view.setY(clamp(metrics.toScreenY(data, height), 0f, Math.max(0f, getHeight() - height)));
+        float scale = globalButtonScaleMultiplier();
+        float baseX = metrics.toScreenX(data, baseWidth);
+        float baseY = metrics.toScreenY(data, baseHeight);
+        float scaledX = scaledControlScreenX(baseX, baseWidth, width, parentWidth, scale);
+        float scaledY = scaledControlScreenY(baseY, baseHeight, height, parentHeight, scale);
+        view.setX(clamp(scaledX, 0f, Math.max(0f, parentWidth - width)));
+        view.setY(clamp(scaledY, 0f, Math.max(0f, parentHeight - height)));
         view.setText(data.label);
         view.setAlpha(clamp(data.opacity, 0f, 1f) * clamp(ControlsPreferences.getGlobalOpacity(getContext()), 0f, 1f));
         view.refreshVisualState();
@@ -2089,9 +2692,9 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
     @NonNull
     private GradientDrawable makeDialogBackground() {
         GradientDrawable drawable = new GradientDrawable();
-        drawable.setColor(0xEE202124);
+        drawable.setColor(LauncherDialogStyle.COLOR_DIALOG_BG);
         drawable.setCornerRadius(dp(22f));
-        drawable.setStroke(Math.max(1, dp(1f)), 0x44FFFFFF);
+        drawable.setStroke(Math.max(1, dp(1f)), LauncherDialogStyle.COLOR_CARD_STROKE);
         return drawable;
     }
 
@@ -3406,6 +4009,9 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
 
     private void sendRelativeCameraDelta(float dx, float dy) {
         try {
+            if (shouldSuppressCameraDeltaAfterRegrab()) {
+                return;
+            }
             CallbackBridge.setInputReady(true);
             CallbackBridge.mouseX += dx;
             CallbackBridge.mouseY += dy;
@@ -3413,6 +4019,14 @@ public final class TouchControlsOverlay extends FrameLayout implements TouchCont
         } catch (Throwable throwable) {
             Logging.e(TAG, "Unable to send camera touch delta", throwable);
         }
+    }
+
+    private boolean shouldSuppressCameraDeltaAfterRegrab() {
+        long until = suppressCameraDeltaUntilUptimeMs;
+        if (until <= 0L) return false;
+        if (SystemClock.uptimeMillis() < until) return true;
+        suppressCameraDeltaUntilUptimeMs = 0L;
+        return false;
     }
 
     private void sendLeftMouse(boolean down) {

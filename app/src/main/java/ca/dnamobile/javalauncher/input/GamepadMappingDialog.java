@@ -205,9 +205,19 @@ public final class GamepadMappingDialog {
 
         CheckBox showCursorOverlay = addCheckBox(activity, overlayCard, "Show controller cursor overlay in menus", store.isShowCursorOverlay());
         addSmallHint(activity, overlayCard, "Visual only. It no longer becomes a touch target, so screen taps and Touch Controller input pass through to Minecraft.");
-        CheckBox showFloatingSettingsButton = addCheckBox(activity, overlayCard, "Show floating settings button", LauncherPreferences.isShowInGameSettingsButton(activity));
-        CheckBox showFpsCounter = addCheckBox(activity, overlayCard, "Show FPS counter on floating button", GameOverlayPreferences.isShowGameFpsCounter(activity));
-        addSmallHint(activity, overlayCard, "Enabled by default. Turn this off if the FPS text feels distracting while playing.");
+        CheckBox showFloatingSettingsButton = addCheckBox(activity, overlayCard, "Show floating settings COG", LauncherPreferences.isShowInGameSettingsButton(activity));
+        addSmallHint(activity, overlayCard, "This only hides or shows the settings COG. The FPS counter has its own separate option below.");
+        CheckBox showFpsCounter = addCheckBox(activity, overlayCard, "Show FPS counter", GameOverlayPreferences.isShowGameFpsCounter(activity));
+        addSmallHint(activity, overlayCard, "Enabled by default. FPS can stay visible even when the settings COG is hidden.");
+
+        addPlainLabel(activity, overlayCard, "FPS counter size");
+        Spinner fpsSizeSpinner = new Spinner(activity);
+        ArrayAdapter<String> fpsSizeAdapter = darkAdapter(activity, Arrays.asList(GameOverlayPreferences.getFpsSizeLabels()));
+        fpsSizeSpinner.setAdapter(fpsSizeAdapter);
+        fpsSizeSpinner.setSelection(GameOverlayPreferences.indexOfFpsSize(GameOverlayPreferences.getGameFpsCounterSize(activity)), false);
+        overlayCard.addView(fpsSizeSpinner, matchWrapWithTopMargin(activity, 2));
+        addSmallHint(activity, overlayCard, "Small keeps the old compact badge. Medium and Large make it easier to read on high-DPI phones.");
+
         CheckBox showLogOverlay = addCheckBox(activity, overlayCard, "Show latest log on the left side", LauncherPreferences.isShowGameLogOverlay(activity));
 
         addPlainLabel(activity, overlayCard, "Touch controls layout");
@@ -367,6 +377,7 @@ public final class GamepadMappingDialog {
                     store.setShowCursorOverlay(showCursorOverlay.isChecked());
                     LauncherPreferences.setShowInGameSettingsButton(activity, showFloatingSettingsButton.isChecked());
                     GameOverlayPreferences.setShowGameFpsCounter(activity, showFpsCounter.isChecked());
+                    GameOverlayPreferences.setGameFpsCounterSize(activity, GameOverlayPreferences.fpsSizeValueForIndex(fpsSizeSpinner.getSelectedItemPosition()));
                     LauncherPreferences.setShowGameLogOverlay(activity, showLogOverlay.isChecked());
                     store.setMenuCursorSensitivity(progressToSensitivity(menuSensitivity.getProgress()));
                     store.setGameCameraSensitivity(progressToSensitivity(gameSensitivity.getProgress()));
@@ -388,6 +399,7 @@ public final class GamepadMappingDialog {
                     store.resetDefaults();
                     ControlsPreferences.resetHotbarHitboxSettings(activity);
                     GameOverlayPreferences.setShowGameFpsCounter(activity, true);
+                    GameOverlayPreferences.setGameFpsCounterSize(activity, GameOverlayPreferences.FPS_SIZE_SMALL);
                     LauncherPreferences.setGameResolutionScalePercent(activity, LauncherPreferences.DEFAULT_GAME_RESOLUTION_SCALE_PERCENT);
                     notifySettingsChanged(activity, listener);
                 })

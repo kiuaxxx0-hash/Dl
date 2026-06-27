@@ -29,6 +29,7 @@ public final class ControlsPreferences {
     private static final String KEY_ENABLED = "enabled";
     private static final String KEY_SELECTED_LAYOUT = "selected_layout";
     private static final String KEY_OPACITY = "opacity";
+    private static final String KEY_GLOBAL_BUTTON_SCALE_PERCENT = "global_button_scale_percent";
     private static final String KEY_EDIT_GRID = "edit_grid";
     private static final String KEY_SNAP_CONTROLS = "snap_controls";
     private static final String KEY_SIZE_PREVIEW_PERCENT = "size_preview_percent";
@@ -62,6 +63,10 @@ public final class ControlsPreferences {
     public static final int MIN_MOUSE_CURSOR_SIZE_PERCENT = 50;
     public static final int MAX_MOUSE_CURSOR_SIZE_PERCENT = 200;
     public static final int DEFAULT_MOUSE_CURSOR_SIZE_PERCENT = 100;
+
+    public static final int MIN_GLOBAL_BUTTON_SCALE_PERCENT = 50;
+    public static final int MAX_GLOBAL_BUTTON_SCALE_PERCENT = 200;
+    public static final int DEFAULT_GLOBAL_BUTTON_SCALE_PERCENT = 100;
 
     private ControlsPreferences() {
     }
@@ -101,6 +106,24 @@ public final class ControlsPreferences {
 
     public static void setGlobalOpacity(@NonNull Context context, float value) {
         prefs(context).edit().putFloat(KEY_OPACITY, clamp(value, 0f, 1f)).apply();
+    }
+
+    public static int getGlobalButtonScalePercent(@NonNull Context context) {
+        return clampInt(
+                prefs(context).getInt(KEY_GLOBAL_BUTTON_SCALE_PERCENT, DEFAULT_GLOBAL_BUTTON_SCALE_PERCENT),
+                MIN_GLOBAL_BUTTON_SCALE_PERCENT,
+                MAX_GLOBAL_BUTTON_SCALE_PERCENT
+        );
+    }
+
+    public static void setGlobalButtonScalePercent(@NonNull Context context, int percent) {
+        prefs(context).edit()
+                .putInt(KEY_GLOBAL_BUTTON_SCALE_PERCENT, clampInt(
+                        percent,
+                        MIN_GLOBAL_BUTTON_SCALE_PERCENT,
+                        MAX_GLOBAL_BUTTON_SCALE_PERCENT
+                ))
+                .apply();
     }
 
     public static boolean isEditGridEnabled(@NonNull Context context) {

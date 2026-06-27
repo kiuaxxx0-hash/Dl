@@ -159,6 +159,7 @@ public final class ModpackUpdateDetailsActivity extends AppCompatActivity {
 
     @Override
     protected void onCreate(@Nullable Bundle savedInstanceState) {
+        LauncherTheme.apply(this);
         super.onCreate(savedInstanceState);
         PathManager.initContextConstants(this);
         readExtras();
@@ -217,6 +218,7 @@ public final class ModpackUpdateDetailsActivity extends AppCompatActivity {
         int padding = dp(20);
         root.setPadding(padding, dp(14), padding, dp(12));
         setContentView(root);
+        LauncherTheme.applyRainbowBackgroundIfNeeded(this);
 
         LinearLayout header = new LinearLayout(this);
         header.setOrientation(LinearLayout.HORIZONTAL);

@@ -52,6 +52,7 @@ import ca.dnamobile.javalauncher.launcher.InstanceLaunchSettings;
 import ca.dnamobile.javalauncher.renderer.RendererInterface;
 import ca.dnamobile.javalauncher.renderer.Renderers;
 import ca.dnamobile.javalauncher.settings.MemoryAllocationUtils;
+import ca.dnamobile.javalauncher.shortcuts.InstanceShortcutHelper;
 
 /**
  * CreateInstanceDialog-style editor for per-instance launch overrides.
@@ -66,6 +67,8 @@ public final class PerInstanceSettingsDialog {
     private final String settingsKey;
     private final ArrayList<String> aliasKeys;
     @Nullable
+    private final InstanceShortcutHelper.ShortcutData shortcutData;
+    @Nullable
     private final Runnable onDismiss;
 
     private AlertDialog dialog;
@@ -74,9 +77,11 @@ public final class PerInstanceSettingsDialog {
     private final ArrayList<String> rendererLabels = new ArrayList<>();
     private int selectedRendererIndex;
     private int selectedRuntimeIndex;
+    private int selectedGraphicsApiModeIndex;
 
     private MaterialAutoCompleteTextView rendererDropdown;
     private MaterialAutoCompleteTextView runtimeDropdown;
+    private MaterialAutoCompleteTextView graphicsApiDropdown;
     private TextInputEditText jvmArgsInput;
     private SwitchMaterial customRamSwitch;
     private TextInputEditText ramInput;
@@ -98,9 +103,20 @@ public final class PerInstanceSettingsDialog {
             @Nullable List<String> aliasKeys,
             @Nullable Runnable onDismiss
     ) {
+        this(activity, settingsKey, aliasKeys, null, onDismiss);
+    }
+
+    public PerInstanceSettingsDialog(
+            @NonNull Activity activity,
+            @NonNull String settingsKey,
+            @Nullable List<String> aliasKeys,
+            @Nullable InstanceShortcutHelper.ShortcutData shortcutData,
+            @Nullable Runnable onDismiss
+    ) {
         this.activity = activity;
         this.settingsKey = settingsKey;
         this.aliasKeys = new ArrayList<>();
+        this.shortcutData = shortcutData;
         addAlias(settingsKey);
         if (aliasKeys != null) {
             for (String key : aliasKeys) addAlias(key);
@@ -144,9 +160,13 @@ public final class PerInstanceSettingsDialog {
         formScroll.addView(form, matchWrap());
 
         form.addView(createRendererSection(settings), matchWrap());
+        form.addView(createGraphicsApiSection(settings), matchWrap());
         form.addView(createRuntimeSection(settings), matchWrap());
         form.addView(createJvmArgsSection(settings), matchWrap());
         form.addView(createRamSection(settings), matchWrap());
+        if (shortcutData != null) {
+            form.addView(createShortcutSection(), matchWrap());
+        }
 
         // Critical: the form takes remaining space only. The action row stays outside
         // the ScrollView, so Save/Cancel/Reset can never be pushed below the screen.
@@ -216,7 +236,7 @@ public final class PerInstanceSettingsDialog {
         textColumn.addView(title, matchWrap());
 
         TextView subtitle = new TextView(activity);
-        subtitle.setText("Renderer, Java runtime, JVM arguments, and RAM for this instance only.");
+        subtitle.setText("Renderer, Graphics API, Java runtime, JVM arguments, and RAM for this instance only.");
         subtitle.setTextSize(13);
         subtitle.setPadding(0, dp(4), 0, 0);
         textColumn.addView(subtitle, matchWrap());
@@ -243,6 +263,36 @@ public final class PerInstanceSettingsDialog {
 
         TextInputLayout layout = createDropdownLayout("Renderer");
         layout.addView(rendererDropdown, matchWrap());
+        section.addView(layout, matchWrap());
+        return section;
+    }
+
+    private View createGraphicsApiSection(@NonNull InstanceLaunchSettings.Settings settings) {
+        LinearLayout section = createSection();
+        addSectionTitle(
+                section,
+                "Minecraft 26.2+ Graphics API",
+                "Per-instance override for Minecraft's Graphics API option. Use this for Vulkan Mod or instances that need OpenGL without changing launcher-wide settings. Older versions ignore this."
+        );
+
+        String[] graphicsApiLabels = InstanceLaunchSettings.getGraphicsApiModeLabels();
+        graphicsApiDropdown = new MaterialAutoCompleteTextView(activity);
+        graphicsApiDropdown.setInputType(InputType.TYPE_NULL);
+        graphicsApiDropdown.setSingleLine(true);
+        graphicsApiDropdown.setOnClickListener(view -> graphicsApiDropdown.showDropDown());
+        graphicsApiDropdown.setAdapter(new ArrayAdapter<>(activity, android.R.layout.simple_list_item_1, graphicsApiLabels));
+        selectedGraphicsApiModeIndex = InstanceLaunchSettings.graphicsApiModeIndex(settings.graphicsApiMode);
+        if (selectedGraphicsApiModeIndex < 0 || selectedGraphicsApiModeIndex >= graphicsApiLabels.length) {
+            selectedGraphicsApiModeIndex = 0;
+        }
+        graphicsApiDropdown.setText(graphicsApiLabels[selectedGraphicsApiModeIndex], false);
+        graphicsApiDropdown.setOnItemClickListener((parent, view, position, id) -> {
+            selectedGraphicsApiModeIndex = Math.max(0, Math.min(position, graphicsApiLabels.length - 1));
+            graphicsApiDropdown.setText(graphicsApiLabels[selectedGraphicsApiModeIndex], false);
+        });
+
+        TextInputLayout layout = createDropdownLayout("Graphics API");
+        layout.addView(graphicsApiDropdown, matchWrap());
         section.addView(layout, matchWrap());
         return section;
     }
@@ -355,6 +405,34 @@ public final class PerInstanceSettingsDialog {
         return section;
     }
 
+    private View createShortcutSection() {
+        LinearLayout section = createSection();
+        addSectionTitle(
+                section,
+                "Home screen shortcut",
+                "Add a launcher shortcut for this instance. It stores only the instance id, so it always uses the current per-instance settings and the current instance icon."
+        );
+
+        MaterialButton shortcutButton = new MaterialButton(activity);
+        shortcutButton.setText("Add Home Screen Shortcut");
+        shortcutButton.setAllCaps(false);
+        shortcutButton.setIconResource(R.drawable.ic_open_in_new_24);
+        shortcutButton.setIconGravity(MaterialButton.ICON_GRAVITY_TEXT_START);
+        shortcutButton.setIconPadding(dp(8));
+        shortcutButton.setOnClickListener(view -> {
+            if (shortcutData == null) {
+                Toast.makeText(activity, "Instance shortcut data is unavailable.", Toast.LENGTH_LONG).show();
+                return;
+            }
+            InstanceShortcutHelper.requestPinShortcut(activity, shortcutData);
+        });
+
+        LinearLayout.LayoutParams buttonParams = matchWrap();
+        buttonParams.setMargins(0, dp(4), 0, 0);
+        section.addView(shortcutButton, buttonParams);
+        return section;
+    }
+
     private View createActionsSection() {
         LinearLayout row = new LinearLayout(activity);
         row.setOrientation(LinearLayout.HORIZONTAL);
@@ -424,6 +502,7 @@ public final class PerInstanceSettingsDialog {
         }
 
         settings.runtimeName = InstanceLaunchSettings.runtimeNameForIndex(selectedRuntimeIndex);
+        settings.graphicsApiMode = InstanceLaunchSettings.graphicsApiModeForIndex(selectedGraphicsApiModeIndex);
         settings.customJvmArgs = jvmArgsInput != null && jvmArgsInput.getText() != null
                 ? jvmArgsInput.getText().toString().trim()
                 : "";

@@ -14,7 +14,10 @@ package ca.dnamobile.javalauncher.input;
 
 import androidx.annotation.Nullable;
 
+import android.view.View;
+
 import ca.dnamobile.javalauncher.controls.TouchControlData;
+import ca.dnamobile.javalauncher.controls.TouchKeyboardHelper;
 import net.kdt.pojavlaunch.LwjglGlfwKeycode;
 
 import org.lwjgl.glfw.CallbackBridge;
@@ -132,14 +135,17 @@ public enum GamepadAction {
     LEFT_ALT(Type.KEY, LwjglGlfwKeycode.GLFW_KEY_LEFT_ALT, 0, "Left Alt"),
     RIGHT_SHIFT(Type.KEY, LwjglGlfwKeycode.GLFW_KEY_RIGHT_SHIFT, 0, "Right Shift"),
     RIGHT_CTRL(Type.KEY, LwjglGlfwKeycode.GLFW_KEY_RIGHT_CONTROL, 0, "Right Ctrl"),
-    RIGHT_ALT(Type.KEY, LwjglGlfwKeycode.GLFW_KEY_RIGHT_ALT, 0, "Right Alt");
+    RIGHT_ALT(Type.KEY, LwjglGlfwKeycode.GLFW_KEY_RIGHT_ALT, 0, "Right Alt"),
+
+    OPEN_ANDROID_KEYBOARD(Type.KEYBOARD, 0, 0, "Open Android Keyboard");
 
     private enum Type {
         NONE,
         KEY,
         MOUSE,
         SCROLL,
-        CURSOR
+        CURSOR,
+        KEYBOARD
     }
 
     private final Type type;
@@ -171,17 +177,33 @@ public enum GamepadAction {
     }
 
     public void perform(boolean down) {
-        perform(down, false);
+        perform(down, false, null);
     }
 
     public void perform(boolean down, boolean pulseMouseClick) {
+        perform(down, pulseMouseClick, null);
+    }
+
+    public void perform(boolean down, boolean pulseMouseClick, @Nullable View sourceView) {
         switch (type) {
             case NONE:
                 return;
 
             case KEY:
+                if (down && isChatOpenKey(code)) {
+                    TouchKeyboardHelper.markChatKeyPressed();
+                }
                 CallbackBridge.sendKeyPress(code, CallbackBridge.getCurrentMods(), down);
                 CallbackBridge.setModifiers(code, down);
+                if (down && isMinecraftCancelKey(code)) {
+                    TouchKeyboardHelper.cancelMinecraftTextInputFromGame(sourceView);
+                }
+                return;
+
+            case KEYBOARD:
+                if (down && sourceView != null) {
+                    TouchKeyboardHelper.showKeyboard(sourceView);
+                }
                 return;
 
             case MOUSE:
@@ -253,6 +275,7 @@ public enum GamepadAction {
             case TouchControlData.SPECIAL_SCROLL_DOWN:
                 return SCROLL_DOWN;
             case TouchControlData.SPECIAL_KEYBOARD:
+                return OPEN_ANDROID_KEYBOARD;
             case TouchControlData.SPECIAL_KEY_SENDER_KEYBOARD:
             case TouchControlData.SPECIAL_MENU:
             case TouchControlData.SPECIAL_TOGGLE_CONTROLS:
@@ -266,6 +289,16 @@ public enum GamepadAction {
                 }
                 return null;
         }
+    }
+
+
+    private static boolean isChatOpenKey(int keyCode) {
+        return keyCode == LwjglGlfwKeycode.GLFW_KEY_T
+                || keyCode == LwjglGlfwKeycode.GLFW_KEY_SLASH;
+    }
+
+    private static boolean isMinecraftCancelKey(int keyCode) {
+        return keyCode == LwjglGlfwKeycode.GLFW_KEY_ESCAPE;
     }
 
     @Override

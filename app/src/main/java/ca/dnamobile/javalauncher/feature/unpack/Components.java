@@ -24,6 +24,7 @@ public enum Components {
     // LWJGL components must live under the app-private files directory so libjvm can dlopen them
     // through the classloader namespace without hitting the external-storage restriction.
     LWJGL3("lwjgl3.3.3", "LWJGL 3.3.3", R.string.splash_screen_lwjgl, true),
+    LWJGL333_BTA("lwjgl3.3.3-bta", "LWJGL 3.3.3 BTA", R.string.splash_screen_lwjgl, true),
     LWJGL341("lwjgl3.4.1", "LWJGL 3.4.1", R.string.splash_screen_lwjgl, true),
 
     // Launcher support components (MioLibPatcher.jar, Forge installer, etc.) are expected from

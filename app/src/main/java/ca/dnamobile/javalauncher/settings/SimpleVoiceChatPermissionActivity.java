@@ -12,6 +12,7 @@
 
 package ca.dnamobile.javalauncher.settings;
 
+import ca.dnamobile.javalauncher.LauncherTheme;
 import android.app.Activity;
 import android.content.Context;
 import android.content.Intent;
@@ -47,6 +48,7 @@ public class SimpleVoiceChatPermissionActivity extends Activity {
 
     @Override
     protected void onCreate(@Nullable Bundle savedInstanceState) {
+        LauncherTheme.apply(this);
         super.onCreate(savedInstanceState);
 
         int padding = dp(20);
@@ -113,6 +115,7 @@ public class SimpleVoiceChatPermissionActivity extends Activity {
         ));
 
         setContentView(root);
+        LauncherTheme.applyRainbowBackgroundIfNeeded(this);
         updateStatus();
     }
 

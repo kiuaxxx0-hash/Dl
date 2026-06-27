@@ -26,13 +26,21 @@ public final class TouchControlsLayoutData {
     public static final String UNIT_DP = "dp";
     public static final String UNIT_PX = "px";
 
+    public static final int IMPORT_MODE_DROIDBRIDGE = 0;
+    public static final int IMPORT_MODE_OTHER_LAUNCHER = 1;
+
+    public static final String PROFILE_DROIDBRIDGE = "droidbridge";
+    public static final String PROFILE_OTHER_LAUNCHER = "other_launcher";
+
     private static final float DEFAULT_IMPORTED_SOURCE_WIDTH = 854f;
     private static final float DEFAULT_IMPORTED_SOURCE_HEIGHT = 480f;
 
     public int version = 4;
     @NonNull public String name = "Touch Controls";
+    @NonNull public String importedFileName = "";
     public float preferredScale = 100f;
     @NonNull public String coordinateUnit = UNIT_DP;
+    @NonNull public String coordinateProfile = PROFILE_DROIDBRIDGE;
     public float sourceWidth = 0f;
     public float sourceHeight = 0f;
 
@@ -44,8 +52,10 @@ public final class TouchControlsLayoutData {
         root.put("format", "JavaLauncherTouchControls");
         root.put("version", version);
         root.put("name", name);
+        if (!importedFileName.trim().isEmpty()) root.put("importedFileName", importedFileName.trim());
         root.put("preferredScale", preferredScale);
         root.put("coordinateUnit", normalizeCoordinateUnit(coordinateUnit));
+        root.put("coordinateProfile", normalizeCoordinateProfile(coordinateProfile));
         if (sourceWidth > 0f) root.put("sourceWidth", sourceWidth);
         if (sourceHeight > 0f) root.put("sourceHeight", sourceHeight);
         JSONArray array = new JSONArray();
@@ -58,13 +68,20 @@ public final class TouchControlsLayoutData {
 
     @NonNull
     public static TouchControlsLayoutData fromJson(@NonNull JSONObject root) throws Exception {
+        return fromJson(root, IMPORT_MODE_DROIDBRIDGE);
+    }
+
+    @NonNull
+    public static TouchControlsLayoutData fromJson(@NonNull JSONObject root, int importMode) throws Exception {
         if (root.has("controls")) {
             TouchControlsLayoutData data = new TouchControlsLayoutData();
             data.version = root.optInt("version", 1);
             data.name = root.optString("name", "Touch Controls");
+            data.importedFileName = readImportedFileName(root);
             data.preferredScale = (float) root.optDouble("preferredScale", root.optDouble("scaledAt", 100d));
             boolean hasExplicitUnit = hasCoordinateUnit(root);
             data.coordinateUnit = readCoordinateUnit(root, UNIT_DP);
+            data.coordinateProfile = readCoordinateProfile(root, importMode);
             readSourceCanvas(root, data);
             JSONArray controls = root.optJSONArray("controls");
             if (controls != null) {
@@ -72,6 +89,10 @@ public final class TouchControlsLayoutData {
                     JSONObject object = controls.optJSONObject(i);
                     if (object != null) data.controls.add(TouchControlData.fromJson(object));
                 }
+            }
+            if (importMode == IMPORT_MODE_OTHER_LAUNCHER) {
+                forceOtherLauncherCoordinateRules(data);
+                return data;
             }
             boolean legacyImportedCanvas = looksLikeImportedCanvasLayout(data);
             if (legacyImportedCanvas && (!hasExplicitUnit || data.version < 3)) {
@@ -93,16 +114,18 @@ public final class TouchControlsLayoutData {
 
         // Pojav/Zalith/Mojo/Amethyst derived layouts normally carry mControlDataList.
         if (root.has("mControlDataList") || root.has("mJoystickDataList") || root.has("mDrawerDataList")) {
-            return fromPojavLikeJson(root);
+            return fromPojavLikeJson(root, importMode);
         }
 
         // Some launchers export a flat buttons array. Treat it as best-effort.
         if (root.has("buttons")) {
             TouchControlsLayoutData data = new TouchControlsLayoutData();
             data.name = root.optString("name", "Imported Controls");
+            data.importedFileName = readImportedFileName(root);
             data.preferredScale = (float) root.optDouble("preferredScale", root.optDouble("scaledAt", 100d));
             boolean hasExplicitUnit = hasCoordinateUnit(root);
             data.coordinateUnit = readCoordinateUnit(root, hasSourceCanvas(root) ? UNIT_PX : UNIT_DP);
+            data.coordinateProfile = readCoordinateProfile(root, importMode);
             readSourceCanvas(root, data);
             JSONArray buttons = root.optJSONArray("buttons");
             if (buttons != null) {
@@ -110,6 +133,10 @@ public final class TouchControlsLayoutData {
                     JSONObject object = buttons.optJSONObject(i);
                     if (object != null) data.controls.add(TouchControlData.fromJson(object));
                 }
+            }
+            if (importMode == IMPORT_MODE_OTHER_LAUNCHER) {
+                forceOtherLauncherCoordinateRules(data);
+                return data;
             }
             boolean legacyImportedCanvas = looksLikeImportedCanvasLayout(data);
             if (legacyImportedCanvas && (!hasExplicitUnit || data.version < 3)) {
@@ -133,12 +160,14 @@ public final class TouchControlsLayoutData {
     }
 
     @NonNull
-    private static TouchControlsLayoutData fromPojavLikeJson(@NonNull JSONObject root) {
+    private static TouchControlsLayoutData fromPojavLikeJson(@NonNull JSONObject root, int importMode) {
         TouchControlsLayoutData data = new TouchControlsLayoutData();
         data.name = root.optString("name", "Imported Pojav/Zalith Controls");
+        data.importedFileName = readImportedFileName(root);
         data.preferredScale = (float) root.optDouble("scaledAt", root.optDouble("preferredScale", 100d));
-        data.coordinateUnit = UNIT_PX;
-        readSourceCanvas(root, data);
+        data.coordinateProfile = importMode == IMPORT_MODE_OTHER_LAUNCHER ? PROFILE_OTHER_LAUNCHER : PROFILE_DROIDBRIDGE;
+        data.coordinateUnit = importMode == IMPORT_MODE_OTHER_LAUNCHER ? UNIT_DP : UNIT_PX;
+        if (importMode != IMPORT_MODE_OTHER_LAUNCHER) readSourceCanvas(root, data);
 
         JSONArray controls = root.optJSONArray("mControlDataList");
         if (controls != null) {
@@ -172,6 +201,11 @@ public final class TouchControlsLayoutData {
             }
         }
 
+        if (importMode == IMPORT_MODE_OTHER_LAUNCHER) {
+            forceOtherLauncherCoordinateRules(data);
+            return data;
+        }
+
         // Old default_touch.json files usually store Android logical layout units
         // from a 1920x1080-class phone, which is about an 854x480 canvas at xxhdpi.
         // Use that as the fallback, and grow only when the coordinates prove it must.
@@ -185,12 +219,28 @@ public final class TouchControlsLayoutData {
         return UNIT_PX.equals(normalizeCoordinateUnit(coordinateUnit));
     }
 
+    public boolean usesOtherLauncherProfile() {
+        return PROFILE_OTHER_LAUNCHER.equals(normalizeCoordinateProfile(coordinateProfile));
+    }
+
     public float resolvedSourceWidth(float fallback) {
         return sourceWidth > 0f ? sourceWidth : Math.max(1f, fallback);
     }
 
     public float resolvedSourceHeight(float fallback) {
         return sourceHeight > 0f ? sourceHeight : Math.max(1f, fallback);
+    }
+
+    @NonNull
+    private static String readImportedFileName(@NonNull JSONObject root) {
+        return firstString(root,
+                "importedFileName",
+                "imported_file_name",
+                "sourceFileName",
+                "source_file_name",
+                "originalFileName",
+                "original_file_name"
+        );
     }
 
     @NonNull
@@ -221,6 +271,42 @@ public final class TouchControlsLayoutData {
         String normalized = value.trim().toLowerCase(Locale.ROOT);
         if ("pixel".equals(normalized) || "pixels".equals(normalized) || "px".equals(normalized)) return UNIT_PX;
         return UNIT_DP;
+    }
+
+    @NonNull
+    private static String readCoordinateProfile(@NonNull JSONObject root, int importMode) {
+        String value = firstString(root,
+                "coordinateProfile",
+                "coordinate_profile",
+                "profile",
+                "importProfile",
+                "import_profile"
+        );
+        if (!value.trim().isEmpty()) return normalizeCoordinateProfile(value);
+        return importMode == IMPORT_MODE_OTHER_LAUNCHER ? PROFILE_OTHER_LAUNCHER : PROFILE_DROIDBRIDGE;
+    }
+
+    @NonNull
+    private static String normalizeCoordinateProfile(@NonNull String value) {
+        String normalized = value.trim().toLowerCase(Locale.ROOT);
+        if ("other".equals(normalized)
+                || "other_launcher".equals(normalized)
+                || "other-launcher".equals(normalized)
+                || "pojav".equals(normalized)
+                || "zalith".equals(normalized)
+                || "mojo".equals(normalized)
+                || "amethyst".equals(normalized)) {
+            return PROFILE_OTHER_LAUNCHER;
+        }
+        return PROFILE_DROIDBRIDGE;
+    }
+
+    private static void forceOtherLauncherCoordinateRules(@NonNull TouchControlsLayoutData data) {
+        data.coordinateProfile = PROFILE_OTHER_LAUNCHER;
+        data.coordinateUnit = UNIT_DP;
+        data.sourceWidth = 0f;
+        data.sourceHeight = 0f;
+        data.version = Math.max(data.version, 5);
     }
 
     private static void readSourceCanvas(@NonNull JSONObject root, @NonNull TouchControlsLayoutData data) {

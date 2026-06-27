@@ -78,6 +78,7 @@ final class TouchControlButtonView extends TextView {
     private final Listener listener;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final int touchSlop;
+    private final int editTapSlop;
 
     private final Paint joystickBasePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint joystickStrokePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -117,13 +118,14 @@ final class TouchControlButtonView extends TextView {
         this.data = data;
         this.listener = listener;
         this.touchSlop = ViewConfiguration.get(context).getScaledTouchSlop();
+        this.editTapSlop = Math.max(this.touchSlop * 2, Math.round(18f * context.getResources().getDisplayMetrics().density));
         setGravity(Gravity.CENTER);
         setTextColor(Color.WHITE);
         setTextSize(13f);
         setIncludeFontPadding(false);
         setSingleLine(false);
         setAllCaps(false);
-        setText(data.label);
+        setText(data.label == null ? "" : data.label);
         setBackground(makeBackground(false));
         setAlpha(resolvedDisplayAlpha());
         setLongClickable(true);
@@ -139,7 +141,7 @@ final class TouchControlButtonView extends TextView {
     }
 
     void refreshVisualState() {
-        setText(data.label);
+        setText(data.label == null ? "" : data.label);
         setBackground(makeBackground(editMode));
         updateInteractionAlpha();
         invalidate();
@@ -158,11 +160,18 @@ final class TouchControlButtonView extends TextView {
     }
 
     private void updateInteractionAlpha() {
+        float displayAlpha = resolvedDisplayAlpha();
         if (!editMode && touchFeedbackActive) {
-            setAlpha(GAME_PRESS_FEEDBACK_ALPHA);
+            // A hidden control must stay fully invisible even while pressed. The old
+            // fixed 50% press feedback made 0% opacity buttons flash on-screen.
+            if (displayAlpha <= 0.001f) {
+                setAlpha(0f);
+            } else {
+                setAlpha(Math.max(displayAlpha, GAME_PRESS_FEEDBACK_ALPHA));
+            }
             return;
         }
-        setAlpha(resolvedDisplayAlpha());
+        setAlpha(displayAlpha);
     }
 
     private void setTouchFeedbackActive(boolean active) {
@@ -232,33 +241,77 @@ final class TouchControlButtonView extends TextView {
     }
 
     private void drawResizeHandle(@NonNull Canvas canvas) {
+        float density = getResources().getDisplayMetrics().density;
         float handle = resizeHandleSize();
         float w = Math.max(1f, getWidth());
         float h = Math.max(1f, getHeight());
-        android.graphics.Path path = new android.graphics.Path();
-        path.moveTo(w, h - handle);
-        path.lineTo(w, h);
-        path.lineTo(w - handle, h);
-        path.close();
-        canvas.drawPath(path, resizeHandlePaint);
-        canvas.drawPath(path, resizeHandleStrokePaint);
 
-        float inset = Math.max(3f, handle * 0.22f);
-        canvas.drawLine(w - inset, h - handle + inset, w - handle + inset, h - inset, resizeHandleStrokePaint);
-        canvas.drawLine(w - inset, h - (handle * 0.62f), w - (handle * 0.62f), h - inset, resizeHandleStrokePaint);
+        // Make the editor resize affordance easier to see and grab. Instead of a
+        // tiny triangle fully inside the control, draw a larger rounded pull tab
+        // anchored to the lower-right corner. The center is biased toward the
+        // corner so it visually feels like it is hanging off the button.
+        float radius = handle * 0.5f;
+        float centerInset = Math.max(3f * density, radius * 0.42f);
+        float centerX = w - centerInset;
+        float centerY = h - centerInset;
+        canvas.drawCircle(centerX, centerY, radius, resizeHandlePaint);
+        canvas.drawCircle(centerX, centerY, radius, resizeHandleStrokePaint);
+
+        float lineGap = Math.max(4f * density, handle * 0.16f);
+        float lineLength = Math.max(10f * density, handle * 0.38f);
+        float startX = centerX + lineGap - lineLength;
+        float startY = centerY + lineGap;
+        canvas.drawLine(startX, startY, startX + lineLength, startY - lineLength, resizeHandleStrokePaint);
+        canvas.drawLine(startX + (lineGap * 0.9f), startY, startX + lineLength, startY - (lineLength * 0.65f), resizeHandleStrokePaint);
     }
 
     private boolean isInResizeHandle(float x, float y) {
-        float handle = resizeHandleHitSize();
-        return editMode && x >= getWidth() - handle && y >= getHeight() - handle;
+        if (!editMode) return false;
+
+        // Keep the resize grip easy to grab without letting the enlarged hit area
+        // swallow most of small buttons. A circular target around the visible
+        // bottom-right tab is friendlier than the old full rectangular corner box,
+        // which could turn normal edit taps into accidental resize starts.
+        float density = getResources().getDisplayMetrics().density;
+        float visualHandle = resizeHandleSize();
+        float hitRadius = Math.max(24f * density, visualHandle * 0.78f);
+        float overhang = resizeHandleOutsideHitOverhang();
+        float centerInset = Math.max(3f * density, (visualHandle * 0.5f) * 0.42f);
+        float centerX = getWidth() - centerInset;
+        float centerY = getHeight() - centerInset;
+
+        if (x < centerX - hitRadius || y < centerY - hitRadius) return false;
+        if (x > getWidth() + overhang || y > getHeight() + overhang) return false;
+
+        float dx = x - centerX;
+        float dy = y - centerY;
+        return (dx * dx) + (dy * dy) <= hitRadius * hitRadius;
+    }
+
+    boolean isInResizeHandleFromParent(float parentX, float parentY) {
+        return isInResizeHandle(parentX - getX(), parentY - getY());
+    }
+
+    private float eventParentX(@NonNull MotionEvent event) {
+        return getX() + event.getX();
+    }
+
+    private float eventParentY(@NonNull MotionEvent event) {
+        return getY() + event.getY();
     }
 
     private float resizeHandleSize() {
-        return Math.max(18f * getResources().getDisplayMetrics().density, Math.min(getWidth(), getHeight()) * 0.32f);
+        float density = getResources().getDisplayMetrics().density;
+        return Math.max(30f * density, Math.min(getWidth(), getHeight()) * 0.38f);
     }
 
     private float resizeHandleHitSize() {
-        return Math.max(28f * getResources().getDisplayMetrics().density, resizeHandleSize());
+        float density = getResources().getDisplayMetrics().density;
+        return Math.max(48f * density, resizeHandleSize());
+    }
+
+    private float resizeHandleOutsideHitOverhang() {
+        return 18f * getResources().getDisplayMetrics().density;
     }
 
     @Override
@@ -281,14 +334,16 @@ final class TouchControlButtonView extends TextView {
                 editLongPressTriggered = false;
                 editDragging = false;
                 editResizing = false;
-                touchOffsetX = event.getRawX() - getX();
-                touchOffsetY = event.getRawY() - getY();
-                downRawX = event.getRawX();
-                downRawY = event.getRawY();
+                float parentDownX = eventParentX(event);
+                float parentDownY = eventParentY(event);
+                touchOffsetX = parentDownX - getX();
+                touchOffsetY = parentDownY - getY();
+                downRawX = parentDownX;
+                downRawY = parentDownY;
                 if (isInResizeHandle(event.getX(), event.getY())) {
                     editResizing = true;
-                    resizeStartRawX = event.getRawX();
-                    resizeStartRawY = event.getRawY();
+                    resizeStartRawX = parentDownX;
+                    resizeStartRawY = parentDownY;
                     resizeStartWidth = getWidth();
                     resizeStartHeight = getHeight();
                     listener.onResizeStarted(this, data);
@@ -299,21 +354,21 @@ final class TouchControlButtonView extends TextView {
                 return true;
             case MotionEvent.ACTION_MOVE:
                 if (editResizing) {
-                    float proposedWidth = resizeStartWidth + (event.getRawX() - resizeStartRawX);
-                    float proposedHeight = resizeStartHeight + (event.getRawY() - resizeStartRawY);
+                    float proposedWidth = resizeStartWidth + (eventParentX(event) - resizeStartRawX);
+                    float proposedHeight = resizeStartHeight + (eventParentY(event) - resizeStartRawY);
                     listener.onResizeRequested(this, data, proposedWidth, proposedHeight);
                     return true;
                 }
                 if (editLongPressTriggered) return true;
-                float dx = event.getRawX() - downRawX;
-                float dy = event.getRawY() - downRawY;
-                if (!editDragging && ((dx * dx) + (dy * dy)) > (touchSlop * touchSlop)) {
+                float dx = eventParentX(event) - downRawX;
+                float dy = eventParentY(event) - downRawY;
+                if (!editDragging && ((dx * dx) + (dy * dy)) > (editTapSlop * editTapSlop)) {
                     editDragging = true;
                     cancelEditLongPress();
                     listener.onMoveStarted(this, data);
                 }
                 if (editDragging) {
-                    listener.onMoveRequested(this, data, Math.max(0f, event.getRawX() - touchOffsetX), Math.max(0f, event.getRawY() - touchOffsetY));
+                    listener.onMoveRequested(this, data, Math.max(0f, eventParentX(event) - touchOffsetX), Math.max(0f, eventParentY(event) - touchOffsetY));
                 }
                 return true;
             case MotionEvent.ACTION_CANCEL:
@@ -465,7 +520,8 @@ final class TouchControlButtonView extends TextView {
         joystickKnobX = joystickCenterX + clampedDx;
         joystickKnobY = joystickCenterY + clampedDy;
         invalidate();
-        float deadzone = Math.max(touchSlop, maxKnobTravel * 0.16f);
+        float configuredDeadzone = TouchControlData.clampJoystickDeadzonePercent(data.joystickDeadzonePercent) / 100f;
+        float deadzone = Math.max(touchSlop, maxKnobTravel * configuredDeadzone);
         setJoystickKeyStates(clampedDy < -deadzone, clampedDx < -deadzone, clampedDy > deadzone, clampedDx > deadzone);
         boolean shouldForwardLock = data.joystickForwardLock && clampedDy < -deadzone && distance > (maxKnobTravel * 0.88f);
         if (shouldForwardLock != joystickForwardLockDown) {

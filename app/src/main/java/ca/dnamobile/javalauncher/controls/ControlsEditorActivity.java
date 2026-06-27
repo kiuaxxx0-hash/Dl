@@ -12,12 +12,21 @@
 
 package ca.dnamobile.javalauncher.controls;
 
+import ca.dnamobile.javalauncher.LauncherTheme;
+import android.content.Context;
 import android.content.SharedPreferences;
+import android.graphics.Rect;
+import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.os.Build;
 import android.os.Bundle;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
+import android.view.Window;
+import android.view.WindowInsets;
+import android.view.WindowInsetsController;
+import android.view.WindowManager;
 import android.view.ViewConfiguration;
 import android.view.ViewGroup;
 import android.view.ViewParent;
@@ -25,12 +34,17 @@ import android.widget.Button;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.SeekBar;
+import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
 import androidx.annotation.Nullable;
+import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
 
+import java.util.Collections;
+
+import ca.dnamobile.javalauncher.ui.LauncherDialogStyle;
 import ca.dnamobile.javalauncher.utils.FullscreenUtils;
 
 /** Drag buttons to move; tap a button to edit/delete it. */
@@ -42,9 +56,17 @@ public final class ControlsEditorActivity extends AppCompatActivity {
     private TouchControlsOverlay overlay;
     private FrameLayout root;
     private LinearLayout editorPanel;
+    private BoundedScrollView editorScroll;
+    private LinearLayout editorContent;
     private Button menuButton;
     private TextView globalOpacityValue;
     private SeekBar globalOpacitySlider;
+    private TextView globalScaleValue;
+    private SeekBar globalScaleSlider;
+    private TextView globalRadiusValue;
+    private SeekBar globalRadiusSlider;
+    private TextView globalStrokeValue;
+    private SeekBar globalStrokeSlider;
 
     private int menuTouchSlop;
     private float menuDownRawX;
@@ -53,14 +75,28 @@ public final class ControlsEditorActivity extends AppCompatActivity {
     private float menuStartY;
     private boolean menuDragging;
 
+    private final Runnable immersiveReapplyRunnable = this::enableImmersiveSafely;
+
     @Override
     protected void onCreate(@Nullable Bundle savedInstanceState) {
+        LauncherTheme.apply(this);
         super.onCreate(savedInstanceState);
 
         menuTouchSlop = ViewConfiguration.get(this).getScaledTouchSlop();
 
         root = new FrameLayout(this);
         setContentView(root);
+        LauncherTheme.applyRainbowBackgroundIfNeeded(this);
+        root.setOnSystemUiVisibilityChangeListener(visibility -> {
+            boolean barsVisible = (visibility & View.SYSTEM_UI_FLAG_FULLSCREEN) == 0
+                    || (visibility & View.SYSTEM_UI_FLAG_HIDE_NAVIGATION) == 0;
+            if (barsVisible) {
+                root.removeCallbacks(immersiveReapplyRunnable);
+                root.postDelayed(immersiveReapplyRunnable, 350L);
+            }
+        });
+        root.addOnLayoutChangeListener((view, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom) -> updateSystemGestureExclusionRects());
+        enableImmersiveSafely();
 
         overlay = new TouchControlsOverlay(this);
         root.addView(overlay, new FrameLayout.LayoutParams(
@@ -70,8 +106,8 @@ public final class ControlsEditorActivity extends AppCompatActivity {
 
         editorPanel = new LinearLayout(this);
         editorPanel.setOrientation(LinearLayout.VERTICAL);
-        editorPanel.setGravity(Gravity.CENTER_VERTICAL);
-        editorPanel.setPadding(dp(10), dp(10), dp(10), dp(10));
+        editorPanel.setGravity(Gravity.TOP);
+        editorPanel.setPadding(dp(12), dp(10), dp(12), dp(10));
         editorPanel.setBackground(makePanelBackground());
         editorPanel.setVisibility(View.GONE);
         root.addView(editorPanel, new FrameLayout.LayoutParams(
@@ -85,6 +121,8 @@ public final class ControlsEditorActivity extends AppCompatActivity {
         menuButton = new Button(this);
         menuButton.setText("⚙");
         menuButton.setTextSize(22f);
+        menuButton.setTextColor(LauncherDialogStyle.COLOR_TEXT_PRIMARY);
+        menuButton.setTypeface(Typeface.DEFAULT_BOLD);
         menuButton.setAllCaps(false);
         menuButton.setAlpha(0.76f);
         menuButton.setBackground(makeGearBackground());
@@ -101,6 +139,7 @@ public final class ControlsEditorActivity extends AppCompatActivity {
                 overlay.loadSelectedLayout();
             }
             enableImmersiveSafely();
+            updateSystemGestureExclusionRects();
         });
     }
 
@@ -110,14 +149,105 @@ public final class ControlsEditorActivity extends AppCompatActivity {
         enableImmersiveSafely();
     }
 
+
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (hasFocus) {
+            enableImmersiveSafely();
+            View decor = getWindow() == null ? null : getWindow().getDecorView();
+            if (decor != null) decor.postDelayed(immersiveReapplyRunnable, 250L);
+            updateSystemGestureExclusionRects();
+        }
+    }
+
+    @Override
+    protected void onDestroy() {
+        if (root != null) {
+            root.removeCallbacks(immersiveReapplyRunnable);
+            root.setOnSystemUiVisibilityChangeListener(null);
+        }
+        super.onDestroy();
+    }
+
+    @Override
+    public void onBackPressed() {
+        requestCloseEditor();
+    }
+
+    private void requestCloseEditor() {
+        if (overlay == null || !overlay.hasEditorSessionChanges()) {
+            finish();
+            return;
+        }
+
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("Close touch editor?")
+                .setMessage("Save your touch-control changes before closing, or close without saving to restore the layout from when you opened the editor.")
+                .setNegativeButton("Close without saving", (unused, which) -> {
+                    if (overlay != null) {
+                        overlay.discardEditorSessionChanges();
+                    }
+                    finish();
+                })
+                .setNeutralButton(android.R.string.cancel, null)
+                .setPositiveButton("Save & Close", (unused, which) -> {
+                    if (overlay != null) {
+                        overlay.saveLayout();
+                        overlay.markEditorSessionSaved();
+                    }
+                    finish();
+                })
+                .create();
+        dialog.setOnShowListener(unused -> LauncherDialogStyle.styleDialogChrome(this, dialog));
+        dialog.setOnDismissListener(unused -> {
+            if (root != null) {
+                root.removeCallbacks(immersiveReapplyRunnable);
+                root.postDelayed(immersiveReapplyRunnable, 150L);
+            }
+        });
+        dialog.show();
+        LauncherDialogStyle.styleDialogChrome(this, dialog);
+    }
+
     private void buildEditorPanel() {
+        LinearLayout headerRow = new LinearLayout(this);
+        headerRow.setOrientation(LinearLayout.HORIZONTAL);
+        headerRow.setGravity(Gravity.CENTER_VERTICAL);
+        headerRow.setPadding(0, 0, 0, dp(6));
+
         TextView header = new TextView(this);
         header.setText("Touch editor");
-        header.setTextSize(14f);
-        header.setTextColor(0xFFE0E0E0);
-        header.setGravity(Gravity.CENTER);
-        header.setPadding(0, 0, 0, dp(6));
-        editorPanel.addView(header, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        header.setTextSize(15f);
+        header.setTypeface(Typeface.DEFAULT_BOLD);
+        header.setTextColor(LauncherDialogStyle.COLOR_TEXT_PRIMARY);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        headerRow.addView(header, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        Button topClose = panelButton("Close");
+        topClose.setOnClickListener(view -> requestCloseEditor());
+        headerRow.addView(topClose, new LinearLayout.LayoutParams(dp(92), dp(38)));
+
+        editorPanel.addView(headerRow, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        editorScroll = new BoundedScrollView(this);
+        editorScroll.setFillViewport(false);
+        editorScroll.setOverScrollMode(View.OVER_SCROLL_IF_CONTENT_SCROLLS);
+        editorScroll.setVerticalScrollBarEnabled(true);
+        editorScroll.setScrollbarFadingEnabled(true);
+
+        editorContent = new LinearLayout(this);
+        editorContent.setOrientation(LinearLayout.VERTICAL);
+        editorContent.setGravity(Gravity.CENTER_HORIZONTAL);
+        editorContent.setPadding(0, 0, 0, dp(4));
+        editorScroll.addView(editorContent, new ScrollView.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        ));
+        editorPanel.addView(editorScroll, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        ));
 
         addGlobalOpacityControls();
 
@@ -166,7 +296,10 @@ public final class ControlsEditorActivity extends AppCompatActivity {
 
         Button save = panelButton("Save");
         save.setOnClickListener(view -> {
-            overlay.saveLayout();
+            if (overlay != null) {
+                overlay.saveLayout();
+                overlay.markEditorSessionSaved();
+            }
             Toast.makeText(this, "Touch controls saved.", Toast.LENGTH_SHORT).show();
         });
         rowTwo.addView(save, panelButtonParams());
@@ -195,14 +328,10 @@ public final class ControlsEditorActivity extends AppCompatActivity {
         hide.setOnClickListener(view -> setPanelVisible(false));
         rowFour.addView(hide, panelButtonParams());
 
-        Button close = panelButton("Close");
-        close.setOnClickListener(view -> finish());
-        rowFour.addView(close, panelButtonParams());
-
-        editorPanel.addView(rowOne);
-        editorPanel.addView(rowTwo);
-        editorPanel.addView(rowThree);
-        editorPanel.addView(rowFour);
+        editorContent.addView(rowOne);
+        editorContent.addView(rowTwo);
+        editorContent.addView(rowThree);
+        editorContent.addView(rowFour);
     }
 
 
@@ -210,20 +339,20 @@ public final class ControlsEditorActivity extends AppCompatActivity {
         TextView title = new TextView(this);
         title.setText("All button opacity");
         title.setTextSize(12f);
-        title.setTextColor(0xFFE0E0E0);
+        title.setTextColor(LauncherDialogStyle.COLOR_TEXT_PRIMARY);
         title.setGravity(Gravity.CENTER);
         title.setPadding(0, dp(4), 0, 0);
-        editorPanel.addView(title, new LinearLayout.LayoutParams(
+        editorContent.addView(title, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
         ));
 
         globalOpacityValue = new TextView(this);
         globalOpacityValue.setTextSize(11f);
-        globalOpacityValue.setTextColor(0xFFBDBDBD);
+        globalOpacityValue.setTextColor(LauncherDialogStyle.COLOR_TEXT_SECONDARY);
         globalOpacityValue.setGravity(Gravity.CENTER);
         globalOpacityValue.setPadding(0, 0, 0, dp(2));
-        editorPanel.addView(globalOpacityValue, new LinearLayout.LayoutParams(
+        editorContent.addView(globalOpacityValue, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
         ));
@@ -256,7 +385,197 @@ public final class ControlsEditorActivity extends AppCompatActivity {
                 if (overlay != null) overlay.refreshButtonVisuals();
             }
         });
-        editorPanel.addView(globalOpacitySlider, new LinearLayout.LayoutParams(
+        editorContent.addView(globalOpacitySlider, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                dp(38)
+        ));
+
+        addGlobalButtonScaleControls();
+    }
+
+    private void addGlobalButtonScaleControls() {
+        TextView title = new TextView(this);
+        title.setText("All button scale");
+        title.setTextSize(12f);
+        title.setTextColor(LauncherDialogStyle.COLOR_TEXT_PRIMARY);
+        title.setGravity(Gravity.CENTER);
+        title.setPadding(0, dp(2), 0, 0);
+        editorContent.addView(title, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        ));
+
+        globalScaleValue = new TextView(this);
+        globalScaleValue.setTextSize(11f);
+        globalScaleValue.setTextColor(LauncherDialogStyle.COLOR_TEXT_SECONDARY);
+        globalScaleValue.setGravity(Gravity.CENTER);
+        globalScaleValue.setPadding(0, 0, 0, dp(2));
+        editorContent.addView(globalScaleValue, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        ));
+
+        globalScaleSlider = new SeekBar(this);
+        globalScaleSlider.setMax(ControlsPreferences.MAX_GLOBAL_BUTTON_SCALE_PERCENT);
+        int progress = ControlsPreferences.getGlobalButtonScalePercent(this);
+        globalScaleSlider.setProgress(Math.max(
+                ControlsPreferences.MIN_GLOBAL_BUTTON_SCALE_PERCENT,
+                Math.min(ControlsPreferences.MAX_GLOBAL_BUTTON_SCALE_PERCENT, progress)
+        ));
+        updateGlobalScaleLabel(globalScaleSlider.getProgress());
+        globalScaleSlider.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                int safeProgress = Math.max(
+                        ControlsPreferences.MIN_GLOBAL_BUTTON_SCALE_PERCENT,
+                        Math.min(ControlsPreferences.MAX_GLOBAL_BUTTON_SCALE_PERCENT, progress)
+                );
+                if (seekBar.getProgress() != safeProgress) {
+                    seekBar.setProgress(safeProgress);
+                    return;
+                }
+                updateGlobalScaleLabel(safeProgress);
+                if (fromUser) {
+                    if (overlay != null) {
+                        overlay.applyGlobalButtonScalePercent(safeProgress);
+                    } else {
+                        ControlsPreferences.setGlobalButtonScalePercent(ControlsEditorActivity.this, safeProgress);
+                    }
+                }
+            }
+
+            @Override
+            public void onStartTrackingTouch(SeekBar seekBar) {
+                if (overlay != null) overlay.beginGlobalButtonScaleChange();
+            }
+
+            @Override
+            public void onStopTrackingTouch(SeekBar seekBar) {
+                int safeProgress = Math.max(
+                        ControlsPreferences.MIN_GLOBAL_BUTTON_SCALE_PERCENT,
+                        Math.min(ControlsPreferences.MAX_GLOBAL_BUTTON_SCALE_PERCENT, seekBar.getProgress())
+                );
+                if (overlay != null) {
+                    overlay.applyGlobalButtonScalePercent(safeProgress);
+                } else {
+                    ControlsPreferences.setGlobalButtonScalePercent(ControlsEditorActivity.this, safeProgress);
+                }
+                updateGlobalScaleLabel(safeProgress);
+            }
+        });
+        editorContent.addView(globalScaleSlider, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                dp(38)
+        ));
+
+        addGlobalButtonAppearanceControls();
+    }
+
+    private void addGlobalButtonAppearanceControls() {
+        TextView radiusTitle = new TextView(this);
+        radiusTitle.setText("All button radius");
+        radiusTitle.setTextSize(12f);
+        radiusTitle.setTextColor(LauncherDialogStyle.COLOR_TEXT_PRIMARY);
+        radiusTitle.setGravity(Gravity.CENTER);
+        radiusTitle.setPadding(0, dp(2), 0, 0);
+        editorContent.addView(radiusTitle, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        ));
+
+        globalRadiusValue = new TextView(this);
+        globalRadiusValue.setTextSize(11f);
+        globalRadiusValue.setTextColor(LauncherDialogStyle.COLOR_TEXT_SECONDARY);
+        globalRadiusValue.setGravity(Gravity.CENTER);
+        globalRadiusValue.setPadding(0, 0, 0, dp(2));
+        editorContent.addView(globalRadiusValue, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        ));
+
+        globalRadiusSlider = new SeekBar(this);
+        globalRadiusSlider.setMax(100);
+        int radiusProgress = overlay == null ? 16 : Math.max(0, Math.min(100, overlay.averageButtonCornerRadius()));
+        globalRadiusSlider.setProgress(radiusProgress);
+        updateGlobalRadiusLabel(radiusProgress);
+        globalRadiusSlider.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                int safeProgress = Math.max(0, Math.min(100, progress));
+                updateGlobalRadiusLabel(safeProgress);
+                if (fromUser && overlay != null) overlay.applyAllButtonCornerRadius(safeProgress);
+            }
+
+            @Override
+            public void onStartTrackingTouch(SeekBar seekBar) {
+                if (overlay != null) overlay.beginBulkControlAppearanceChange();
+            }
+
+            @Override
+            public void onStopTrackingTouch(SeekBar seekBar) {
+                int safeProgress = Math.max(0, Math.min(100, seekBar.getProgress()));
+                if (overlay != null) {
+                    overlay.applyAllButtonCornerRadius(safeProgress);
+                    overlay.finishBulkControlAppearanceChange();
+                }
+                updateGlobalRadiusLabel(safeProgress);
+            }
+        });
+        editorContent.addView(globalRadiusSlider, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                dp(38)
+        ));
+
+        TextView strokeTitle = new TextView(this);
+        strokeTitle.setText("All button stroke");
+        strokeTitle.setTextSize(12f);
+        strokeTitle.setTextColor(LauncherDialogStyle.COLOR_TEXT_PRIMARY);
+        strokeTitle.setGravity(Gravity.CENTER);
+        strokeTitle.setPadding(0, dp(2), 0, 0);
+        editorContent.addView(strokeTitle, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        ));
+
+        globalStrokeValue = new TextView(this);
+        globalStrokeValue.setTextSize(11f);
+        globalStrokeValue.setTextColor(LauncherDialogStyle.COLOR_TEXT_SECONDARY);
+        globalStrokeValue.setGravity(Gravity.CENTER);
+        globalStrokeValue.setPadding(0, 0, 0, dp(2));
+        editorContent.addView(globalStrokeValue, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        ));
+
+        globalStrokeSlider = new SeekBar(this);
+        globalStrokeSlider.setMax(20);
+        int strokeProgress = overlay == null ? 2 : Math.max(0, Math.min(20, overlay.averageButtonStrokeWidth()));
+        globalStrokeSlider.setProgress(strokeProgress);
+        updateGlobalStrokeLabel(strokeProgress);
+        globalStrokeSlider.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                int safeProgress = Math.max(0, Math.min(20, progress));
+                updateGlobalStrokeLabel(safeProgress);
+                if (fromUser && overlay != null) overlay.applyAllButtonStrokeWidth(safeProgress);
+            }
+
+            @Override
+            public void onStartTrackingTouch(SeekBar seekBar) {
+                if (overlay != null) overlay.beginBulkControlAppearanceChange();
+            }
+
+            @Override
+            public void onStopTrackingTouch(SeekBar seekBar) {
+                int safeProgress = Math.max(0, Math.min(20, seekBar.getProgress()));
+                if (overlay != null) {
+                    overlay.applyAllButtonStrokeWidth(safeProgress);
+                    overlay.finishBulkControlAppearanceChange();
+                }
+                updateGlobalStrokeLabel(safeProgress);
+            }
+        });
+        editorContent.addView(globalStrokeSlider, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 dp(38)
         ));
@@ -265,6 +584,28 @@ public final class ControlsEditorActivity extends AppCompatActivity {
     private void updateGlobalOpacityLabel(int progress) {
         if (globalOpacityValue != null) {
             globalOpacityValue.setText("Opacity: " + Math.max(0, Math.min(100, progress)) + "%");
+        }
+    }
+
+    private void updateGlobalScaleLabel(int progress) {
+        if (globalScaleValue != null) {
+            int safeProgress = Math.max(
+                    ControlsPreferences.MIN_GLOBAL_BUTTON_SCALE_PERCENT,
+                    Math.min(ControlsPreferences.MAX_GLOBAL_BUTTON_SCALE_PERCENT, progress)
+            );
+            globalScaleValue.setText("Scale: " + safeProgress + "%");
+        }
+    }
+
+    private void updateGlobalRadiusLabel(int progress) {
+        if (globalRadiusValue != null) {
+            globalRadiusValue.setText("Radius: " + Math.max(0, Math.min(100, progress)) + " dp");
+        }
+    }
+
+    private void updateGlobalStrokeLabel(int progress) {
+        if (globalStrokeValue != null) {
+            globalStrokeValue.setText("Stroke: " + Math.max(0, Math.min(20, progress)) + " dp");
         }
     }
 
@@ -310,9 +651,27 @@ public final class ControlsEditorActivity extends AppCompatActivity {
     }
 
     private void setPanelVisible(boolean visible) {
+        if (visible) syncGlobalAppearanceSlidersFromLayout();
         editorPanel.setVisibility(visible ? View.VISIBLE : View.GONE);
         menuButton.setAlpha(visible ? 1.0f : 0.76f);
-        if (visible) editorPanel.post(this::positionPanelNearMenuButton);
+        if (visible) {
+            if (editorScroll != null) editorScroll.post(() -> editorScroll.smoothScrollTo(0, 0));
+            editorPanel.post(this::positionPanelNearMenuButton);
+        }
+    }
+
+    private void syncGlobalAppearanceSlidersFromLayout() {
+        if (overlay == null) return;
+        if (globalRadiusSlider != null) {
+            int radius = Math.max(0, Math.min(100, overlay.averageButtonCornerRadius()));
+            globalRadiusSlider.setProgress(radius);
+            updateGlobalRadiusLabel(radius);
+        }
+        if (globalStrokeSlider != null) {
+            int stroke = Math.max(0, Math.min(20, overlay.averageButtonStrokeWidth()));
+            globalStrokeSlider.setProgress(stroke);
+            updateGlobalStrokeLabel(stroke);
+        }
     }
 
     private void restoreMenuButtonPosition() {
@@ -342,7 +701,13 @@ public final class ControlsEditorActivity extends AppCompatActivity {
 
     private void positionPanelNearMenuButton() {
         if (root.getWidth() <= 0 || root.getHeight() <= 0) return;
-        editorPanel.measure(View.MeasureSpec.makeMeasureSpec(root.getWidth(), View.MeasureSpec.AT_MOST), View.MeasureSpec.makeMeasureSpec(root.getHeight(), View.MeasureSpec.AT_MOST));
+        updateEditorScrollLimit();
+        int maxPanelWidth = Math.max(dp(320), root.getWidth() - dp(8));
+        int maxPanelHeight = Math.max(dp(260), root.getHeight() - dp(8));
+        editorPanel.measure(
+                View.MeasureSpec.makeMeasureSpec(maxPanelWidth, View.MeasureSpec.AT_MOST),
+                View.MeasureSpec.makeMeasureSpec(maxPanelHeight, View.MeasureSpec.AT_MOST)
+        );
         int panelWidth = Math.max(1, editorPanel.getMeasuredWidth());
         int panelHeight = Math.max(1, editorPanel.getMeasuredHeight());
         float spacing = dp(8);
@@ -357,6 +722,42 @@ public final class ControlsEditorActivity extends AppCompatActivity {
         editorPanel.setY(clamp(y, dp(4), Math.max(dp(4), root.getHeight() - panelHeight - dp(4))));
     }
 
+    private void updateEditorScrollLimit() {
+        if (editorScroll == null || root == null || root.getHeight() <= 0) return;
+
+        // Keep the title/Close row fixed, but let the slider/action area scroll on
+        // shorter landscape screens so Undo/Redo/Hide panel are not clipped.
+        int maxPanelHeight = Math.max(dp(260), root.getHeight() - dp(8));
+        int fixedHeaderAndPadding = dp(66);
+        editorScroll.setMaxHeight(Math.max(dp(180), maxPanelHeight - fixedHeaderAndPadding));
+    }
+
+    private static final class BoundedScrollView extends ScrollView {
+        private int maxHeight;
+
+        BoundedScrollView(Context context) {
+            super(context);
+        }
+
+        void setMaxHeight(int maxHeight) {
+            if (this.maxHeight == maxHeight) return;
+            this.maxHeight = Math.max(0, maxHeight);
+            requestLayout();
+        }
+
+        @Override
+        protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
+            if (maxHeight > 0) {
+                int mode = MeasureSpec.getMode(heightMeasureSpec);
+                int size = MeasureSpec.getSize(heightMeasureSpec);
+                if (mode == MeasureSpec.UNSPECIFIED || size > maxHeight) {
+                    heightMeasureSpec = MeasureSpec.makeMeasureSpec(maxHeight, MeasureSpec.AT_MOST);
+                }
+            }
+            super.onMeasure(widthMeasureSpec, heightMeasureSpec);
+        }
+    }
+
     private LinearLayout panelRow() {
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
@@ -369,6 +770,9 @@ public final class ControlsEditorActivity extends AppCompatActivity {
         Button button = new Button(this);
         button.setText(text);
         button.setAllCaps(false);
+        button.setTextColor(LauncherDialogStyle.COLOR_TEXT_PRIMARY);
+        button.setTypeface(Typeface.DEFAULT_BOLD);
+        button.setBackground(LauncherDialogStyle.roundedDrawable(this, LauncherDialogStyle.COLOR_CARD_BG_PRESSED, LauncherDialogStyle.COLOR_CARD_STROKE, 14));
         button.setMinHeight(0);
         button.setMinimumHeight(0);
         button.setPadding(dp(8), 0, dp(8), 0);
@@ -383,22 +787,62 @@ public final class ControlsEditorActivity extends AppCompatActivity {
 
     private GradientDrawable makePanelBackground() {
         GradientDrawable drawable = new GradientDrawable();
-        drawable.setColor(0xDD111111);
+        drawable.setColor(LauncherDialogStyle.COLOR_CARD_BG);
         drawable.setCornerRadius(dp(18));
-        drawable.setStroke(dp(1), 0x55FFFFFF);
+        drawable.setStroke(dp(1), LauncherDialogStyle.COLOR_CARD_STROKE);
         return drawable;
     }
 
     private GradientDrawable makeGearBackground() {
         GradientDrawable drawable = new GradientDrawable();
-        drawable.setColor(0xDD202124);
+        drawable.setColor(LauncherDialogStyle.COLOR_CARD_BG);
         drawable.setShape(GradientDrawable.OVAL);
-        drawable.setStroke(dp(1), 0x66FFFFFF);
+        drawable.setStroke(dp(1), LauncherDialogStyle.COLOR_CARD_STROKE);
         return drawable;
+    }
+
+    private void updateSystemGestureExclusionRects() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q || root == null) return;
+        int width = root.getWidth();
+        int height = root.getHeight();
+        if (width <= 0 || height <= 0) return;
+        root.setSystemGestureExclusionRects(Collections.singletonList(new Rect(0, 0, width, height)));
     }
 
     private void enableImmersiveSafely() {
         try { FullscreenUtils.enableImmersive(this); } catch (Throwable ignored) { }
+
+        updateSystemGestureExclusionRects();
+
+        try {
+            Window window = getWindow();
+            if (window == null) return;
+
+            window.setFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN, WindowManager.LayoutParams.FLAG_FULLSCREEN);
+
+            View decor = window.getDecorView();
+            if (decor != null) {
+                decor.setSystemUiVisibility(
+                        View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                                | View.SYSTEM_UI_FLAG_FULLSCREEN
+                                | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                                | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                                | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                                | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                );
+
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    WindowInsetsController controller = decor.getWindowInsetsController();
+                    if (controller != null) {
+                        controller.hide(WindowInsets.Type.statusBars() | WindowInsets.Type.navigationBars());
+                        controller.setSystemBarsBehavior(
+                                WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                        );
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
     }
 
     private void updateSnapButtonText(Button button) {

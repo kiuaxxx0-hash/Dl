@@ -14,8 +14,8 @@ LOCAL_PATH := $(HERE_PATH)
 
 # Mesa direct-EGL mode for DroidBridge Mesa/Freedreno.
 #
-# Do NOT build an app-local LOCAL_MODULE := EGL shim for the Mojo-style KGSL
-# path. Mojo's working path lets libpojavexec load libEGL_mesa.so through its
+# Do NOT build an app-local LOCAL_MODULE := EGL shim for the Direct KGSL
+# path. The working path lets libpojavexec load libEGL_mesa.so through its
 # own EGL loader while the bridge remains linked against Android's normal EGL
 # symbols for ANativeWindow/GLSurface setup. Linking libpojavexec directly to
 # the DroidBridge libEGL.so shim made GLFW fail before it could create the
@@ -27,8 +27,12 @@ LOCAL_LDLIBS := -ldl -llog -landroid -lEGL -lGLESv2
 LOCAL_MODULE := pojavexec
 LOCAL_SHARED_LIBRARIES := driver_helper
 # Keep libpojavexec on Android system EGL symbols; it will still load Mesa via
-# POJAVEXEC_EGL=libEGL_mesa.so at runtime, matching Mojo's KGSL path.
-LOCAL_CFLAGS += -rdynamic
+# POJAVEXEC_EGL=libEGL_mesa.so at runtime, matching the KGSL path.
+# v59: libpojavexec.c's egl_bridge.c also uses #ifdef ADRENO_POSSIBLE around
+# loadTurnipVulkan(). Previously only driver_helper was compiled with this
+# define, so source-built libpojavexec silently skipped the bundled Turnip
+# loader and fell back to the system libvulkan.so path.
+LOCAL_CFLAGS += -rdynamic -DADRENO_POSSIBLE
 LOCAL_SRC_FILES := \
     bigcoreaffinity.c \
     egl_bridge.c \
@@ -45,6 +49,7 @@ LOCAL_SRC_FILES := \
     utils.c \
     stdio_is.c \
     java_exec_hooks.c \
+    droidbridge_renderspec.c \
     lwjgl_dlopen_hook.c
 
 include $(BUILD_SHARED_LIBRARY)
@@ -62,7 +67,7 @@ include $(CLEAR_VARS)
 LOCAL_LDLIBS := -ldl -llog -landroid -lEGL -lGLESv2
 LOCAL_MODULE := driver_helper
 # Enable Android linker namespace loading for Mesa/Freedreno KGSL. This is the
-# key difference from Mojo's working log: "Loaded EGL libEGL_mesa.so (in namespace: 1)".
+# key requirement for the working log: "Loaded EGL libEGL_mesa.so (in namespace: 1)".
 LOCAL_CFLAGS += -DADRENO_POSSIBLE
 # Keep driver_helper on Android system EGL symbols; Mesa itself is selected
 # dynamically through POJAVEXEC_EGL/libEGL_mesa.so.
@@ -281,7 +286,7 @@ LOCAL_LDFLAGS += -Wl,-soname,libXdmcp.so.6
 include $(BUILD_SHARED_LIBRARY)
 
 
-# App-local libdrm compatibility layer for DroidBridge/Mojo Mesa.
+# App-local libdrm compatibility layer for DroidBridge Mesa.
 #
 # Do not use the old tiny WebRTC drm_stub.c here. Mesa's libEGL_mesa.so and
 # libgallium_dri.so have DT_NEEDED libdrm.so and require symbols including
